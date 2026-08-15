@@ -2,14 +2,23 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { readFileSync } = require('node:fs');
 const loadTs = require('./load-ts.cjs');
 
 const {
+  choosePersistentRecoverySession,
   parsePersistentRecoveryRequest,
   planPersistentRecovery,
   tokenizeSavedCommand
 } = loadTs('src/main/persistentRecovery.ts');
 const { PtyManager } = loadTs('src/main/pty.ts');
+
+test('Michael is told how to authorize the exact legacy blank-session exception', () => {
+  const hiveSource = readFileSync(require.resolve('../src/main/hive.ts'), 'utf8');
+  assert.match(hiveSource, /LEGACY BLANK EXCEPTION/);
+  assert.match(hiveSource, /"blankAssignment"/);
+  assert.match(hiveSource, /SHA-256 of the exact unread JSON bytes/);
+});
 
 const recipe = {
   id: 'oscar-code-quality',
@@ -53,7 +62,13 @@ test('parsePersistentRecoveryRequest requires a scoped same-session request', ()
   assert.match(parsePersistentRecoveryRequest(request({ expectedSessionId: '' })).error, /expectedSessionId/);
   assert.match(parsePersistentRecoveryRequest(request({ agentId: '../god' })).error, /agentId/);
   assert.match(parsePersistentRecoveryRequest(request({ reason: '' })).error, /reason/);
+  assert.match(parsePersistentRecoveryRequest(request({ blankAssignment: { id: 'standing-hire-1', sha256: 'bad' } })).error, /SHA-256/);
   assert.match(parsePersistentRecoveryRequest({ ...request(), spec: 'anything' }).error, /spec/);
+  const blankAssignment = { id: 'standing-hire-stanley-1', sha256: 'a'.repeat(64) };
+  assert.deepEqual(
+    parsePersistentRecoveryRequest(request({ blankAssignment })),
+    { ok: true, request: request({ blankAssignment }) },
+  );
 });
 
 test('planPersistentRecovery restarts a live saved agent without changing identity or worktree', () => {
@@ -98,6 +113,31 @@ test('planPersistentRecovery restores an archived recipe with the same recorded 
     livePtyOwners: new Map()
   });
   assert.equal(legacy.recipe.ptyId, 'pty-oscar-code-quality');
+});
+
+test('a standing Claude hire with no transcript and an unread approved assignment restarts fresh', () => {
+  assert.equal(choosePersistentRecoverySession({
+    provider: 'claude',
+    standingHire: true,
+    transcriptExists: false,
+    unreadStandingAssignment: true,
+    firstTurnConfirmed: undefined,
+    explicitLegacyBlank: true
+  }), 'fresh-bootstrap');
+
+  // A fresh-session fallback is deliberately much narrower than ordinary
+  // recovery. Any evidence of prior work, another provider, or a non-standing
+  // identity keeps the exact-session resume requirement.
+  for (const input of [
+    { provider: 'claude', standingHire: true, transcriptExists: true, unreadStandingAssignment: true, explicitLegacyBlank: true },
+    { provider: 'claude', standingHire: true, transcriptExists: false, unreadStandingAssignment: false, explicitLegacyBlank: true },
+    { provider: 'claude', standingHire: true, transcriptExists: false, unreadStandingAssignment: true, explicitLegacyBlank: false },
+    { provider: 'claude', standingHire: true, transcriptExists: false, unreadStandingAssignment: true, firstTurnConfirmed: true, explicitLegacyBlank: true },
+    { provider: 'codex', standingHire: true, transcriptExists: false, unreadStandingAssignment: true, explicitLegacyBlank: true },
+    { provider: 'claude', standingHire: false, transcriptExists: false, unreadStandingAssignment: true, explicitLegacyBlank: true }
+  ]) {
+    assert.equal(choosePersistentRecoverySession(input), 'resume');
+  }
 });
 
 test('planPersistentRecovery fails closed for god, ephemeral workers, stale sessions and missing recipes', () => {
