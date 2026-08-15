@@ -894,7 +894,7 @@ export function useHive(config: HarnessConfig | null): void {
         action: 'starting up',
         progress: 0,
         currentStation: 'desk',
-        ptyId: rec.id,
+        ptyId: rec.ptyId || rec.id,
         command: rec.command,
         provider: rec.provider as Agent['provider'],
         isGod: false,

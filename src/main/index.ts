@@ -74,6 +74,12 @@ import { IntegrationBroker } from './integrationBroker';
 import * as integrations from './integrations';
 import { validateBaseUrl, buildAuthHeaders, resolveUpstreamUrl, secretRefFor, INTEGRATION_TEMPLATES } from '../shared/integrations';
 import { RosterStore } from './roster';
+import {
+  parsePersistentRecoveryRequest,
+  planPersistentRecovery,
+  tokenizeSavedCommand,
+  type PersistentRecoveryPlan,
+} from './persistentRecovery';
 import { ControlRegistry } from './control';
 import { fetchHireManifest, readHireManifestFile } from './hire';
 import { parseHireDeepLink, type HireManifest } from '../shared/hire';
@@ -236,6 +242,25 @@ const ptyToAgent = new Map<string, string>();
  *  install disabled) so the freshly-installed CLI launches in the SAME pty/window —
  *  no user click. Cleared the moment it's consumed, so it can never loop installs. */
 const pendingInstallRelaunch = new Map<string, { opts: AgentSpawnOptions; owner: Electron.WebContents | null; bin: string }>();
+/** A planned same-id/session recovery. Unlike ordinary PTY teardown this keeps
+ * the agent identity and worktree bookkeeping intact while the old process exits
+ * and the saved session is relaunched into the same terminal slot. */
+const pendingPersistentRecovery = new Map<string, {
+  state: 'awaiting-exit' | 'relaunching';
+  opts: AgentSpawnOptions;
+  owner: Electron.WebContents | null;
+  recipe: Extract<PersistentRecoveryPlan, { ok: true }>['recipe'];
+  complete: () => void;
+  fail: (reason: string) => void;
+}>();
+/** Agent ids reserved by the recovery controller. Manual/UI spawns are refused
+ * while a same-session handoff is in flight so a healthy concurrent winner can
+ * never be killed or archived by the recovery's failure path. */
+const activePersistentRecoveryAgents = new Set<string>();
+/** Once recovery touches a persistent worker's existing worktree, that checkout
+ * becomes preserve-only. A failed resume or later early CLI exit must never turn
+ * recovery into an implicit `git worktree remove --force`. */
+const protectedRecoveryWorktrees = new Set<string>();
 const hive = new HiveManager(
   () => readConfig().harnessHome,
   (channel, payload) => {
@@ -431,7 +456,10 @@ function teardownPty(id: string): void {
     // teardown routes — a worker that finished (controller kill), crashed, or was
     // idle-reaped all land here. Normal agents keep the immediate force-remove.
     const worker = liveWorkers.get(id);
-    if (worker) {
+    if (protectedRecoveryWorktrees.has(id)) {
+      protectedRecoveryWorktrees.delete(id);
+      console.warn(`[recovery] preserving persistent worktree after PTY exit: ${wtPath}`);
+    } else if (worker) {
       liveWorkers.delete(id);
       void finalizeWorkerWorktree(wtPath, origCwd, worker);
     } else {
@@ -533,6 +561,40 @@ function removeWorkerScratch(workerId: string): void {
 // relaunch carries `noAutoInstall`, so the installer can never fire (let alone loop) a
 // second time — a binary that's somehow still missing just spawns and exits normally.
 ptyManager.setExitHandler((id, exitCode) => {
+  const recovery = pendingPersistentRecovery.get(id);
+  if (recovery) {
+    if (recovery.state !== 'awaiting-exit') {
+      pendingPersistentRecovery.delete(id);
+      recovery.fail('the replacement process exited before recovery completed');
+      return;
+    }
+    recovery.state = 'relaunching';
+    // Re-arm the existing terminal grid, then require the exact recorded session.
+    // No teardown here: identity, inbox, memory and any tracked worktree stay put.
+    const owner = recovery.owner && !recovery.owner.isDestroyed() ? recovery.owner : null;
+    try { (owner ?? liveWebContents())?.send(`pty:relaunch:${id}`); } catch { /* window gone */ }
+    void spawnAgentCore(recovery.opts, owner)
+      .then(async (res) => {
+        if (!res.ok) {
+          recovery.fail(res.error ?? 'saved session could not be relaunched');
+          return;
+        }
+        const replacement = ptyManager.list().find((entry) => entry.id === recovery.recipe.ptyId);
+        if (!replacement) {
+          recovery.fail('the replacement process exited before it could be verified');
+          return;
+        }
+        const ready = await waitForPersistentRecoveryReady(
+          recovery.recipe.ptyId,
+          recovery.recipe.id,
+          replacement.pid,
+        );
+        if (ready.ok) recovery.complete();
+        else recovery.fail(ready.error);
+      })
+      .catch((e) => recovery.fail(e instanceof Error ? e.message : String(e)));
+    return;
+  }
   const pending = pendingInstallRelaunch.get(id);
   if (pending) {
     pendingInstallRelaunch.delete(id);
@@ -2403,7 +2465,7 @@ function findCodexHomeForSession(sessionId: string, siblingsRoot: string): strin
 
 /** Spawn options shared by the `pty:spawn` IPC handler and the god-triggered
  *  ephemeral-worker watcher. */
-type AgentSpawnOptions = SpawnOptions & { hive?: AgentMeta; isolate?: boolean; resume?: boolean; requireResume?: boolean; resumeSessionId?: string; provider?: AgentProvider; noAutoInstall?: boolean };
+type AgentSpawnOptions = SpawnOptions & { hive?: AgentMeta; isolate?: boolean; resume?: boolean; requireResume?: boolean; resumeSessionId?: string; provider?: AgentProvider; noAutoInstall?: boolean; persistentRecovery?: boolean };
 
 ipcMain.handle('pty:spawn', async (evt, opts: AgentSpawnOptions) => {
   if (!opts || typeof opts.id !== 'string' || typeof opts.cwd !== 'string' || typeof opts.command !== 'string') {
@@ -2422,6 +2484,9 @@ ipcMain.handle('pty:spawn', async (evt, opts: AgentSpawnOptions) => {
  *  no renderer `evt`). `owner` is the window that should receive this PTY's output
  *  (null → the primary window). Behavior-identical to the prior inline handler. */
 async function spawnAgentCore(opts: AgentSpawnOptions, owner: Electron.WebContents | null): Promise<{ ok: boolean; error?: string; cwd?: string; worktreePath?: string; resumeNotFound?: boolean; resumed?: boolean; seedPrompt?: string }> {
+  if (opts.hive?.id && activePersistentRecoveryAgents.has(opts.hive.id) && opts.persistentRecovery !== true) {
+    return { ok: false, error: `agent recovery is already in progress: ${opts.hive.id}` };
+  }
   // ── cwd INGESTION — expand `~` exactly once, here ───────────────────────────
   // This is the single door every agent spawn comes through (`pty:spawn` IPC and
   // the god-triggered ephemeral-worker watcher), so it is where a user-typed
@@ -2959,6 +3024,7 @@ ipcMain.handle('config:changeHome', async (_evt, payload: unknown) => {
   try { clearContextTimers(); } catch (e) { console.error('[changeHome] clearContextTimers:', e); }
   try { stopWebhookDoneObserver(); } catch (e) { console.error('[changeHome] stopWebhookDoneObserver:', e); }
   try { stopEphemeralWorkerWatcher(); } catch (e) { console.error('[changeHome] stopWorkerWatcher:', e); }
+  try { stopPersistentRecoveryWatcher(); } catch (e) { console.error('[changeHome] stopRecoveryWatcher:', e); }
   try { integrationBroker.stop(); } catch (e) { console.error('[changeHome] broker.stop:', e); }
   try { hive.stopRouter(); } catch (e) { console.error('[changeHome] stopRouter:', e); }
   try { hookServer.stop(); } catch (e) { console.error('[changeHome] hookServer.stop:', e); }
@@ -3275,6 +3341,7 @@ function teardownAndQuit(): void {
   try { clearContextTimers(); } catch (e) { console.error('[quit] clearContextTimers:', e); }
   try { stopWebhookDoneObserver(); } catch (e) { console.error('[quit] stopWebhookDoneObserver:', e); }
   try { stopEphemeralWorkerWatcher(); } catch (e) { console.error('[quit] stopWorkerWatcher:', e); }
+  try { stopPersistentRecoveryWatcher(); } catch (e) { console.error('[quit] stopRecoveryWatcher:', e); }
   try { integrationBroker.stop(); } catch (e) { console.error('[quit] broker.stop:', e); }
   try { hive.stopRouter(); } catch (e) { console.error('[quit] stopRouter:', e); }
   try { hookServer.stop(); } catch (e) { console.error('[quit] hookServer.stop:', e); }
@@ -3332,6 +3399,7 @@ ipcMain.handle('app:resetAll', () => {
   try { clearContextTimers(); } catch (e) { console.error('[reset] clearContextTimers:', e); }
   try { stopWebhookDoneObserver(); } catch (e) { console.error('[reset] stopWebhookDoneObserver:', e); }
   try { stopEphemeralWorkerWatcher(); } catch (e) { console.error('[reset] stopWorkerWatcher:', e); }
+  try { stopPersistentRecoveryWatcher(); } catch (e) { console.error('[reset] stopRecoveryWatcher:', e); }
   try { integrationBroker.stop(); } catch (e) { console.error('[reset] broker.stop:', e); }
   try { hive.stopRouter(); } catch (e) { console.error('[reset] stopRouter:', e); }
   try { hookServer.stop(); } catch (e) { console.error('[reset] hookServer.stop:', e); }
@@ -4034,6 +4102,325 @@ ipcMain.handle('realtime:waitFor', (_e, taskId: unknown, timeoutMs: unknown) =>
     : Promise.resolve({ timedOut: true as const, taskId: '' }));
 completionWatcher.start();
 
+// ─── orchestrator-triggered persistent-agent recovery ───────────────────────
+// Michael can already inspect fleet/registry/process/inbox evidence and re-send
+// work through the hive. This queue supplies the one missing rung: resume the
+// SAME persistent roster id and recorded CLI session without asking the human to
+// click through Add Agent. Requests are file-based like ephemeral spawn requests,
+// but strictly narrower: an existing non-god id, a CAS expectedSessionId, and a
+// saved roster recipe are all mandatory; fresh-session fallback is forbidden.
+
+const RECOVERY_TICK_MS = 1_500;
+let recoveryWatchTimer: ReturnType<typeof setInterval> | null = null;
+let recoveryTickRunning = false;
+let recoveryArchiveSeq = 0;
+
+function recoveryRequestsDir(): string | null {
+  const root = hive.root();
+  return root ? join(root, 'recovery-requests') : null;
+}
+
+function archivePersistentRecoveryRequest(filePath: string, sub: '.done' | '.failed'): void {
+  const queue = recoveryRequestsDir();
+  if (!queue) return;
+  try {
+    const dir = join(queue, sub);
+    mkdirSync(dir, { recursive: true });
+    const name = basename(filePath);
+    let destination = join(dir, name);
+    if (existsSync(destination)) {
+      recoveryArchiveSeq += 1;
+      const stem = name.endsWith('.json') ? name.slice(0, -5) : name;
+      destination = join(dir, `${stem}.duplicate-${Date.now()}-${recoveryArchiveSeq}.json`);
+    }
+    renameSync(filePath, destination);
+  } catch (e) {
+    console.error('[recovery] archive request failed:', e);
+  }
+}
+
+function broadcastRecoveredAgent(
+  plan: Extract<PersistentRecoveryPlan, { ok: true }>,
+  executable: string,
+  cwd: string,
+  owner: Electron.WebContents | null,
+): void {
+  const { recipe } = plan;
+  try {
+    const target = owner && !owner.isDestroyed() ? owner : liveWebContents();
+    target?.send('hive:agentSpawned', {
+      id: recipe.id,
+      ptyId: recipe.ptyId,
+      name: recipe.name,
+      provider: recipe.provider ?? inferAgentProvider(executable),
+      cwd,
+      command: recipe.command,
+      role: recipe.description,
+      ...(recipe.worktreePath === cwd ? { worktreePath: recipe.worktreePath } : {}),
+    });
+  } catch { /* window gone */ }
+}
+
+/** Attaching a resume flag is necessary but not sufficient: the CLI can start,
+ * reject a stale/corrupt session, and exit a moment later. Recovery is complete
+ * only after the exact replacement PID has produced terminal output and stayed
+ * alive under the expected agent ownership for a short stability window. */
+async function waitForPersistentRecoveryReady(
+  ptyId: string,
+  agentId: string,
+  pid: number,
+  timeoutMs = 20_000,
+  stableOutputMs = 3_000,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const deadline = Date.now() + timeoutMs;
+  let outputObservedAt = 0;
+  while (Date.now() < deadline) {
+    const entry = ptyManager.list().find((candidate) => candidate.id === ptyId);
+    if (!entry || entry.pid !== pid) {
+      return { ok: false, error: 'the replacement process exited during session resume' };
+    }
+    if (ptyToAgent.get(ptyId) !== agentId) {
+      return { ok: false, error: 'PTY ownership changed during session resume' };
+    }
+    if (entry.hasOutput) {
+      if (!outputObservedAt) outputObservedAt = Date.now();
+      if (Date.now() - outputObservedAt >= stableOutputMs) return { ok: true };
+    }
+    await new Promise<void>((resolveReady) => setTimeout(resolveReady, 250));
+  }
+  return { ok: false, error: 'the replacement process never reached a stable interactive state' };
+}
+
+async function processPersistentRecoveryRequest(filePath: string): Promise<void> {
+  let raw: unknown;
+  try { raw = JSON.parse(readFileSync(filePath, 'utf8')); }
+  catch {
+    archivePersistentRecoveryRequest(filePath, '.failed');
+    informGod('[persistent recovery rejected] invalid JSON', `Could not parse ${basename(filePath)}.`);
+    return;
+  }
+  const parsed = parsePersistentRecoveryRequest(raw);
+  if (!parsed.ok) {
+    archivePersistentRecoveryRequest(filePath, '.failed');
+    informGod('[persistent recovery rejected]', `${basename(filePath)}: ${parsed.error}.`);
+    return;
+  }
+  const requestName = `${parsed.request.id}.json`;
+  if (basename(filePath) !== requestName) {
+    archivePersistentRecoveryRequest(filePath, '.failed');
+    informGod('[persistent recovery rejected]', `${basename(filePath)} must be named ${requestName}.`);
+    return;
+  }
+  const queue = recoveryRequestsDir();
+  if (queue && existsSync(join(queue, '.done', requestName))) {
+    archivePersistentRecoveryRequest(filePath, '.failed');
+    informGod('[persistent recovery rejected]', `${parsed.request.id}: duplicate of an already completed request.`);
+    return;
+  }
+  const snapshot = roster.read();
+  if (!snapshot) {
+    archivePersistentRecoveryRequest(filePath, '.failed');
+    informGod('[persistent recovery rejected]', `${parsed.request.id}: no readable saved roster.`);
+    return;
+  }
+  const plan = planPersistentRecovery({
+    request: parsed.request,
+    registry: hive.registry(),
+    roster: snapshot,
+    livePtyOwners: new Map(
+      ptyManager.list().map((entry) => [entry.id, ptyToAgent.get(entry.id) ?? '']),
+    ),
+  });
+  if (!plan.ok) {
+    archivePersistentRecoveryRequest(filePath, '.failed');
+    informGod('[persistent recovery rejected]', `${parsed.request.id}: ${plan.error}.`);
+    return;
+  }
+  if (pendingPersistentRecovery.has(plan.recipe.ptyId) || activePersistentRecoveryAgents.has(plan.recipe.id)) {
+    archivePersistentRecoveryRequest(filePath, '.failed');
+    informGod('[persistent recovery rejected]', `${parsed.request.id}: recovery is already in flight for ${plan.recipe.name}.`);
+    return;
+  }
+
+  let argv: string[];
+  try { argv = tokenizeSavedCommand(plan.recipe.command); }
+  catch (e) {
+    archivePersistentRecoveryRequest(filePath, '.failed');
+    informGod('[persistent recovery rejected]', `${parsed.request.id}: ${e instanceof Error ? e.message : String(e)}.`);
+    return;
+  }
+  const [command, ...args] = argv;
+  if (plan.recipe.worktreePath && !existsSync(plan.recipe.worktreePath)) {
+    archivePersistentRecoveryRequest(filePath, '.failed');
+    informGod(
+      '[persistent recovery rejected]',
+      `${parsed.request.id}: saved worktree no longer exists (${plan.recipe.worktreePath}); refusing to run in the shared checkout.`,
+    );
+    return;
+  }
+  const cwd = plan.recipe.worktreePath ?? plan.recipe.cwd;
+  if (!existsSync(cwd)) {
+    archivePersistentRecoveryRequest(filePath, '.failed');
+    informGod('[persistent recovery rejected]', `${parsed.request.id}: saved cwd no longer exists (${cwd}).`);
+    return;
+  }
+  const provider = inferAgentProvider(command, plan.recipe.provider as AgentProvider | undefined);
+  const opts: AgentSpawnOptions = {
+    id: plan.recipe.ptyId,
+    cwd,
+    command,
+    args,
+    cols: 100,
+    rows: 30,
+    isolate: false,
+    resume: true,
+    // Bind the spawn to the session that passed the planner's compare-and-swap;
+    // never re-read a potentially changed registry value during async setup.
+    resumeSessionId: plan.sessionId,
+    // Never turn an operational recovery into a blank replacement session.
+    requireResume: true,
+    persistentRecovery: true,
+    provider,
+    hive: {
+      id: plan.recipe.id,
+      name: plan.recipe.name,
+      provider,
+      cwd,
+      role: plan.recipe.description,
+    },
+  };
+
+  const originalOwner = plan.mode === 'restart' ? ptyManager.owner(plan.recipe.ptyId) : null;
+  activePersistentRecoveryAgents.add(plan.recipe.id);
+  if (plan.recipe.worktreePath) protectedRecoveryWorktrees.add(plan.recipe.ptyId);
+
+  const succeed = (): void => {
+    activePersistentRecoveryAgents.delete(plan.recipe.id);
+    archivePersistentRecoveryRequest(filePath, '.done');
+    broadcastRecoveredAgent(plan, command, cwd, originalOwner);
+    informGod(
+      `[persistent recovery complete] ${plan.recipe.name}`,
+      `${plan.recipe.name} was ${plan.mode === 'restart' ? 'restarted' : 'restored'} under the same id ` +
+      `(${plan.recipe.id}) and recorded session (${plan.sessionId}). Verify inbox consumption, then close any stale fleet-health humanQA.`,
+    );
+  };
+  const fail = (reason: string): void => {
+    activePersistentRecoveryAgents.delete(plan.recipe.id);
+    // Only stop/archive a PTY still owned by THIS recovered identity. If any
+    // unexpected concurrent process won the id, leave it untouched and surface
+    // the failed CAS instead of destroying a healthy, unrelated worker.
+    const live = ptyManager.list().find((entry) => entry.id === plan.recipe.ptyId);
+    const owner = ptyToAgent.get(plan.recipe.ptyId);
+    const ours = owner === plan.recipe.id || (!live && !owner);
+    if (live && owner === plan.recipe.id) {
+      try { ptyManager.kill(plan.recipe.ptyId); } catch { /* already gone */ }
+    }
+    if (ours) {
+      // Run the standard non-destructive cleanup too (broker grant, provider
+      // proxy sidecar, breaker, registry). protectedRecoveryWorktrees makes its
+      // worktree branch preserve-only.
+      teardownPty(plan.recipe.ptyId);
+      protectedRecoveryWorktrees.delete(plan.recipe.ptyId);
+      try {
+        const target = originalOwner && !originalOwner.isDestroyed() ? originalOwner : liveWebContents();
+        target?.send('hive:agentArchived', { id: plan.recipe.id });
+      } catch { /* window gone */ }
+    }
+    archivePersistentRecoveryRequest(filePath, '.failed');
+    informGod(
+      `[persistent recovery failed] ${plan.recipe.name}`,
+      `${plan.recipe.name} was not replaced with a fresh session: ${reason}. ` +
+      `The saved recipe and worktree were preserved. Continue the recovery ladder; escalate only a genuine human-only boundary.`,
+    );
+  };
+
+  if (plan.mode === 'restart') {
+    await new Promise<void>((resolveRecovery) => {
+      let settled = false;
+      const settle = (outcome: 'success' | 'failure', reason?: string): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        pendingPersistentRecovery.delete(plan.recipe.ptyId);
+        if (outcome === 'success') succeed();
+        else fail(reason ?? 'saved session could not be relaunched');
+        resolveRecovery();
+      };
+      // A SIGHUP-resistant child is force-killed by PtyManager after four seconds.
+      // Keep a wider controller bound so a broken node-pty callback cannot wedge
+      // the queue forever. kill() suppresses any late onExit handoff via the PTY
+      // identity guard, while our recovery maps/worktree remain untouched.
+      const timeout = setTimeout(() => {
+        pendingPersistentRecovery.delete(plan.recipe.ptyId);
+        try { ptyManager.kill(plan.recipe.ptyId); } catch { /* already gone */ }
+        settle('failure', 'the old process did not complete the recovery handoff within 30 seconds');
+      }, 30_000);
+      timeout.unref?.();
+      pendingPersistentRecovery.set(plan.recipe.ptyId, {
+        state: 'awaiting-exit',
+        opts,
+        owner: originalOwner,
+        recipe: plan.recipe,
+        complete: () => settle('success'),
+        fail: (reason) => settle('failure', reason),
+      });
+      const killed = ptyManager.requestExit(plan.recipe.ptyId);
+      if (!killed.ok) {
+        pendingPersistentRecovery.delete(plan.recipe.ptyId);
+        settle('failure', killed.error ?? 'old PTY could not be stopped');
+      }
+    });
+    return;
+  }
+
+  try {
+    const res = await spawnAgentCore(opts, null);
+    if (!res.ok) {
+      fail(res.error ?? 'saved session could not be restored');
+      return;
+    }
+    const replacement = ptyManager.list().find((entry) => entry.id === plan.recipe.ptyId);
+    if (!replacement) {
+      fail('the replacement process exited before it could be verified');
+      return;
+    }
+    const ready = await waitForPersistentRecoveryReady(plan.recipe.ptyId, plan.recipe.id, replacement.pid);
+    if (ready.ok) succeed();
+    else fail(ready.error);
+  } catch (e) {
+    fail(e instanceof Error ? e.message : String(e));
+  }
+}
+
+async function persistentRecoveryTick(): Promise<void> {
+  if (recoveryTickRunning) return;
+  const dir = recoveryRequestsDir();
+  if (!dir) return;
+  recoveryTickRunning = true;
+  try {
+    mkdirSync(dir, { recursive: true });
+    const files = readdirSync(dir).filter((name) => name.endsWith('.json')).sort();
+    // One at a time: recovery is deliberately rare and sequential ordering makes
+    // its lifecycle/audit trail unambiguous.
+    if (files[0]) await processPersistentRecoveryRequest(join(dir, files[0]));
+  } catch (e) {
+    console.error('[recovery] tick failed:', e);
+  } finally {
+    recoveryTickRunning = false;
+  }
+}
+
+function startPersistentRecoveryWatcher(): void {
+  if (recoveryWatchTimer || !hive.enabled()) return;
+  const dir = recoveryRequestsDir();
+  if (dir) { try { mkdirSync(dir, { recursive: true }); } catch { /* noop */ } }
+  recoveryWatchTimer = setInterval(() => { void persistentRecoveryTick(); }, RECOVERY_TICK_MS);
+}
+
+function stopPersistentRecoveryWatcher(): void {
+  if (recoveryWatchTimer) { clearInterval(recoveryWatchTimer); recoveryWatchTimer = null; }
+}
+
 // ─── god-triggered ephemeral Slack workers ──────────────────────────────────
 // god drops a spawn-request JSON into HIVE_ROOT/spawn-requests/; MAIN polls that
 // queue (same cadence + atomic-rename archival as the hive router — reliability
@@ -4455,6 +4842,7 @@ function bootstrapHiveServices(): void {
   archiveOrphanedAgents(); // #57/#58: archive stale archived:false entries with no live PTY
   hive.startRouter();
   startEphemeralWorkerWatcher(); // poll HIVE_ROOT/spawn-requests → ephemeral workers
+  startPersistentRecoveryWatcher(); // poll HIVE_ROOT/recovery-requests → same-id/session recovery
   // Phase 2: the loopback secret broker. Bind it BEFORE workers spawn so each spawn can
   // be granted a capability token + the broker URL in its env. Loopback-only, idempotent.
   void integrationBroker.start().then((r) => {

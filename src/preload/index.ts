@@ -800,7 +800,7 @@ const api = {
    *  the floor card from this descriptor since it didn't initiate the hire itself. */
   onHiveAgentSpawned: (
     cb: (rec: {
-      id: string; name: string; provider?: string; cwd: string;
+      id: string; ptyId?: string; name: string; provider?: string; cwd: string;
       command?: string; role?: string; worktreePath?: string;
     }) => void
   ): (() => void) => {

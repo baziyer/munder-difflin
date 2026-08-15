@@ -1069,6 +1069,9 @@ export class HiveManager {
       : meta.isAssistant
       ? 'You are Michael\'s PREP ASSISTANT. You will be handed short, possibly vague instructions (each begins with "ENRICH TASK:"). For each one: (1) figure out which project it concerns and cd into the most relevant repo — you start in Michael\'s home directory; (2) gather concrete context READ-ONLY (exact file paths, current state, relevant code, conventions, active branch, gotchas) — NEVER modify, create, or delete files; (3) rewrite the instruction into ONE clear, self-contained prompt that Michael can execute autonomously, preserving the user\'s original intent without inventing scope. Then deliver it: write ONE message JSON into your outbox with "to":"god", "act":"request", a short subject, and the finished prompt as the body. Do NOT perform the task yourself — your only output is the improved prompt sent to Michael.'
       : 'For anything ambiguous, cross-cutting, or needing sign-off, address a message to "god".';
+    const recoveryLine = meta.isGod
+      ? `PERSISTENT FLEET RECOVERY: You own routine worker liveness; never make the human inspect, nudge, or restart an idle worker. First inspect fleet.json, registry.json, the exact process, inbox/.done timestamps, saved session and worktree state; re-deliver one concrete instruction; use one temporary diagnostic worker if the cause is unclear. When a persistent worker still needs recovery, write ONE JSON file to ${root}/recovery-requests/<request-id>.json: {"spec":"munder-difflin/recover@1","id":"<request-id>","agentId":"<existing-id>","expectedSessionId":"<CURRENT registry sessionId>","reason":"<evidence and steps already tried>"}. The harness only restores/restarts the same non-god roster id from its saved recipe and refuses a changed/missing session rather than starting fresh. Before requesting it, checkpoint exact HEAD/status/diff or its existing backup; afterwards verify inbox consumption and close stale fleet-health humanQA. Escalate only a genuine human-only boundary (unavoidable interactive trust/approval, credentials, new spend/infrastructure, irreversible action, or product decision).`
+      : '';
     const guardrailsLine = 'Guardrails: a circuit breaker watches the floor — a "Circuit breaker: steer/constrain" message means you are looping or overspending, so STOP repeating, summarize what you tried, and follow it. Be token-frugal (a floor-wide or per-agent token budget can pause you). The shared plan has two parts: board.md (freeform; god is the sole scribe) and tasks.json (structured kanban — todo/doing/blocked/done).';
     const slackLine = meta.isGod
       ? 'SLACK REPLIES: When composing a Slack reply (or writing the `result` field of a Slack-origin kanban card), you MUST: (1) directly address what the user asked — never a bare "done"; (2) include the relevant specifics, outcome, and details; (3) format for Slack mrkdwn — open with a short *bold* headline, use bullet points for multiple items, wrap code/paths in `backtick` blocks, keep it concise (no walls of text). When finishing a Slack-origin task, always write a complete, user-facing, well-formatted `result` on the kanban card — the system posts it verbatim to Slack as the done reply.'
@@ -1086,6 +1089,7 @@ export class HiveManager {
       memoryLine,
       knowledgeLine,
       godLine,
+      recoveryLine,
       slackLine,
       `Env vars available to you: AGENT_ID, AGENT_NAME, HIVE_ROOT, AGENT_DIR.`
     ].filter(Boolean).join('\n');
@@ -1980,6 +1984,33 @@ sessions (they're spawned independently) — \`fleet.json\` is your source of tr
 look at one agent, read its \`agents/<id>/memory.md\` and \`inbox/\`, or send it a \`query\`. A full
 Claude Code command reference (slash = your own session only; CLI = your shell, can target the fleet)
 is in \`COMMANDS.md\` in the hive root.
+
+## Persistent fleet recovery (orchestrator only)
+The god owns routine worker liveness; do not make the human inspect, nudge, or
+restart an idle worker. First inspect \`fleet.json\`, \`registry.json\`, the exact
+process, inbox/\`.done\` timestamps, session and worktree state; re-send one
+concrete instruction; use one temporary diagnostic worker if the cause is
+unclear. Before recovery, checkpoint exact HEAD/status/diff or confirm its
+existing backup. Then write one JSON file to
+\`recovery-requests/<request-id>.json\`:
+
+\`\`\`json
+{
+  "spec": "munder-difflin/recover@1",
+  "id": "recover-oscar-20260815T1600Z",
+  "agentId": "oscar-code-quality",
+  "expectedSessionId": "the CURRENT sessionId from registry.json",
+  "reason": "Evidence of the stall and the recovery steps already tried"
+}
+\`\`\`
+
+The harness accepts only an existing non-god persistent roster id with a saved
+spawn recipe and an unchanged recorded session. It restores/restarts that same
+session and refuses instead of silently starting fresh. Requests move to
+\`.done/\` or \`.failed/\`. Verify inbox consumption and close stale fleet-health
+\`humanQA\` afterwards. Escalate only a genuine human-only boundary: unavoidable
+interactive trust/approval, credentials, new spend/infrastructure, irreversible
+action, or product choice.
 
 ## Semantic memory (optional — when \`mempalace\` is installed)
 When \`MEMPALACE_PALACE_PATH\` is set in your environment, the hive shares a
