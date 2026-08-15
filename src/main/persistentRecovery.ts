@@ -12,6 +12,10 @@ export interface PersistentRecoveryRequest {
   agentId: string;
   expectedSessionId: string;
   reason: string;
+  /** Explicit proof for replacing a legacy standing hire whose SessionStart
+   * hook ran before any first user turn. The digest binds the exact unread
+   * harness assignment; it is never inferred from a body prefix. */
+  blankAssignment?: { id: string; sha256: string };
 }
 
 export interface PersistentRecoveryRecipe {
@@ -24,6 +28,7 @@ export interface PersistentRecoveryRecipe {
   ptyId: string;
   description?: string;
   standingHire?: boolean;
+  standingHireFirstTurnConfirmed?: boolean;
 }
 
 interface RegistryAgentLike {
@@ -33,6 +38,7 @@ interface RegistryAgentLike {
   sessionId?: unknown;
   archived?: unknown;
   standingHire?: unknown;
+  standingHireFirstTurnConfirmed?: unknown;
 }
 
 interface RegistryLike {
@@ -52,6 +58,29 @@ export type PersistentRecoveryPlan =
       sessionId: string;
     }
   | { ok: false; error: string };
+
+/** Choose the only safe fresh-session exception to exact-session recovery.
+ * A newly approved standing Claude identity can emit SessionStart before it
+ * ever receives a prompt. If there is still no transcript and its approved
+ * assignment is unread, there is no prior conversation or work to lose. Every
+ * other case remains fail-closed on exact resume. */
+export function choosePersistentRecoverySession(input: {
+  provider: string;
+  standingHire: boolean;
+  transcriptExists: boolean;
+  unreadStandingAssignment: boolean;
+  firstTurnConfirmed?: boolean;
+  explicitLegacyBlank: boolean;
+}): 'resume' | 'fresh-bootstrap' {
+  return input.provider === 'claude'
+    && input.standingHire
+    && !input.transcriptExists
+    && input.unreadStandingAssignment
+    && input.firstTurnConfirmed !== true
+    && input.explicitLegacyBlank
+    ? 'fresh-bootstrap'
+    : 'resume';
+}
 
 function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -86,6 +115,18 @@ export function parsePersistentRecoveryRequest(value: unknown): RecoveryParseRes
   if (!expectedSessionId.ok) return expectedSessionId;
   const reason = requiredString(input.reason, 'reason', { max: MAX_REASON });
   if (!reason.ok) return reason;
+  let blankAssignment: PersistentRecoveryRequest['blankAssignment'];
+  if (input.blankAssignment !== undefined) {
+    const proof = record(input.blankAssignment);
+    if (!proof) return { ok: false, error: 'blankAssignment must be an object' };
+    const assignmentId = requiredString(proof.id, 'blankAssignment.id', { id: true });
+    if (!assignmentId.ok) return assignmentId;
+    const sha256 = typeof proof.sha256 === 'string' ? proof.sha256.trim().toLowerCase() : '';
+    if (!/^[a-f0-9]{64}$/.test(sha256)) {
+      return { ok: false, error: 'blankAssignment.sha256 must be a SHA-256 digest' };
+    }
+    blankAssignment = { id: assignmentId.value, sha256 };
+  }
   return {
     ok: true,
     request: {
@@ -94,6 +135,7 @@ export function parsePersistentRecoveryRequest(value: unknown): RecoveryParseRes
       agentId: agentId.value,
       expectedSessionId: expectedSessionId.value,
       reason: reason.value,
+      ...(blankAssignment ? { blankAssignment } : {}),
     },
   };
 }
@@ -166,7 +208,13 @@ export function planPersistentRecovery(input: {
   // Standing-hire status is main-owned registry state. Do not depend on the
   // renderer round-tripping an orchestration marker through its roster card.
   const recipe = agent.standingHire === true
-    ? { ...savedRecipe, standingHire: true }
+    ? {
+        ...savedRecipe,
+        standingHire: true,
+        ...(typeof agent.standingHireFirstTurnConfirmed === 'boolean'
+          ? { standingHireFirstTurnConfirmed: agent.standingHireFirstTurnConfirmed }
+          : {}),
+      }
     : savedRecipe;
   const liveOwner = livePtyOwners.get(recipe.ptyId);
   if (livePtyOwners.has(recipe.ptyId) && liveOwner !== request.agentId) {

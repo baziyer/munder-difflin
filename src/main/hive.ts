@@ -143,6 +143,8 @@ export interface AgentMeta {
   standingHire?: boolean;
   /** Present only while that exact approved request is still provisioning. */
   standingHireRequestId?: string;
+  /** Durable proof that Munder observed this standing hire's first user turn. */
+  standingHireFirstTurnConfirmed?: boolean;
 }
 
 export interface RegistryAgent extends AgentMeta {
@@ -853,10 +855,31 @@ export class HiveManager {
       const agent = reg.agents[id];
       if (!agent || agent.standingHire !== true || agent.standingHireRequestId !== requestId) return false;
       delete agent.standingHireRequestId;
+      agent.standingHireFirstTurnConfirmed = true;
       this.writeJson(join(root, 'registry.json'), reg);
       return true;
     } catch (e) {
       console.error('[hive] standing-hire completion marker failed:', e);
+      return false;
+    }
+  }
+
+  /** Record first-turn proof after a narrowly authorised legacy blank-session
+   * recovery. This marker prevents later transcript loss from authorising a
+   * second fresh session. */
+  confirmStandingHireFirstTurn(id: string): boolean {
+    const root = this.root();
+    if (!root) return false;
+    try {
+      const reg = this.registry();
+      const agent = reg.agents[id];
+      if (!agent || agent.standingHire !== true) return false;
+      if (agent.standingHireFirstTurnConfirmed === true) return true;
+      agent.standingHireFirstTurnConfirmed = true;
+      this.writeJson(join(root, 'registry.json'), reg);
+      return true;
+    } catch (e) {
+      console.error('[hive] standing-hire first-turn marker failed:', e);
       return false;
     }
   }
@@ -872,6 +895,9 @@ export class HiveManager {
       if (!agent || agent.standingHire !== true) return false;
       if (agent.standingHireRequestId && agent.standingHireRequestId !== requestId) return false;
       agent.standingHireRequestId = requestId;
+      if (agent.standingHireFirstTurnConfirmed !== true) {
+        agent.standingHireFirstTurnConfirmed = false;
+      }
       this.writeJson(join(root, 'registry.json'), reg);
       return true;
     } catch (e) {
@@ -1159,7 +1185,7 @@ export class HiveManager {
       ? 'You are Michael\'s PREP ASSISTANT. You will be handed short, possibly vague instructions (each begins with "ENRICH TASK:"). For each one: (1) figure out which project it concerns and cd into the most relevant repo — you start in Michael\'s home directory; (2) gather concrete context READ-ONLY (exact file paths, current state, relevant code, conventions, active branch, gotchas) — NEVER modify, create, or delete files; (3) rewrite the instruction into ONE clear, self-contained prompt that Michael can execute autonomously, preserving the user\'s original intent without inventing scope. Then deliver it: write ONE message JSON into your outbox with "to":"god", "act":"request", a short subject, and the finished prompt as the body. Do NOT perform the task yourself — your only output is the improved prompt sent to Michael.'
       : 'For anything ambiguous, cross-cutting, or needing sign-off, address a message to "god".';
     const recoveryLine = meta.isGod
-      ? `PERSISTENT FLEET RECOVERY: You own routine worker liveness; never make the human inspect, nudge, or restart an idle worker. First inspect fleet.json, registry.json, the exact process, inbox/.done timestamps, saved session and worktree state; re-deliver one concrete instruction; use one temporary diagnostic worker if the cause is unclear. When a persistent worker still needs recovery, write ONE JSON file to ${root}/recovery-requests/<request-id>.json: {"spec":"munder-difflin/recover@1","id":"<request-id>","agentId":"<existing-id>","expectedSessionId":"<CURRENT registry sessionId>","reason":"<evidence and steps already tried>"}. The harness only restores/restarts the same non-god roster id from its saved recipe and refuses a changed/missing session rather than starting fresh. Before requesting it, checkpoint exact HEAD/status/diff or its existing backup; afterwards verify inbox consumption and close stale fleet-health humanQA. Escalate only a genuine human-only boundary (unavoidable interactive trust/approval, credentials, new spend/infrastructure, irreversible action, or product decision).`
+      ? `PERSISTENT FLEET RECOVERY: You own routine worker liveness; never make the human inspect, nudge, or restart an idle worker. First inspect fleet.json, registry.json, the exact process, inbox/.done timestamps, saved session and worktree state; re-deliver one concrete instruction; use one temporary diagnostic worker if the cause is unclear. When a persistent worker still needs recovery, write ONE JSON file to ${root}/recovery-requests/<request-id>.json: {"spec":"munder-difflin/recover@1","id":"<request-id>","agentId":"<existing-id>","expectedSessionId":"<CURRENT registry sessionId>","reason":"<evidence and steps already tried>"}. The harness restores/restarts that exact session. LEGACY BLANK EXCEPTION: only when you prove the standing Claude hire has zero prior user turns, no usable transcript, and its exact harness assignment is still unread, add "blankAssignment":{"id":"<exact unread filename without .json>","sha256":"<SHA-256 of the exact unread JSON bytes>"}. This proof authorises one fresh first turn under the same identity; omit it from ordinary recovery. Before requesting recovery, checkpoint exact HEAD/status/diff or its existing backup; afterwards verify inbox consumption and close stale fleet-health humanQA. Escalate only a genuine human-only boundary (unavoidable interactive trust/approval, credentials, new spend/infrastructure, irreversible action, or product decision).`
       : '';
     const availabilityLine = meta.isGod
       ? 'AVAILABILITY: Never park your terminal in an unbounded sleep/until/tail/poll loop. Do one bounded check, act, then return to orchestration; Munder scheduler and inbox delivery drive the next turn.'
@@ -2145,6 +2171,20 @@ session and refuses instead of silently starting fresh. Requests move to
 \`humanQA\` afterwards. Escalate only a genuine human-only boundary: unavoidable
 interactive trust/approval, credentials, new spend/infrastructure, irreversible
 action, or product choice.
+
+For one legacy blank standing Claude hire only, first prove all of these facts:
+zero prior user turns, no usable transcript, and the exact harness assignment is
+still unread. Then add this field to the same request:
+
+\`\`\`json
+"blankAssignment": {
+  "id": "the exact unread assignment filename without .json",
+  "sha256": "the SHA-256 digest of the exact unread JSON file bytes"
+}
+\`\`\`
+
+This digest-bound proof authorizes one fresh first turn under the same identity.
+Do not add it to ordinary recovery. A durable first-turn marker prevents reuse.
 
 ## Authorized standing hires (orchestrator only)
 Importing a shared hire manifest remains review-only. Once the human explicitly

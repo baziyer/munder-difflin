@@ -14,7 +14,7 @@ const os = require('node:os');
 const path = require('node:path');
 const loadTs = require('./load-ts.cjs');
 
-const { projectDir } = loadTs('src/main/transcript.ts');
+const { projectDir, sessionTranscriptHasUserTurn } = loadTs('src/main/transcript.ts');
 
 /** projectDir() resolves against os.homedir(), which POSIX reads from $HOME — so
  *  each case gets a throwaway home and never touches the real ~/.claude. */
@@ -94,6 +94,19 @@ test('a legacy-only install still resolves, so old transcripts stay readable', (
   withHome((_home, mkProject) => {
     const legacy = mkProject('Users-me-app');
     assert.equal(projectDir('/Users/me/app'), legacy);
+  });
+});
+
+test('sessionTranscriptHasUserTurn distinguishes SessionStart and empty files from a real turn', () => {
+  withHome((home) => {
+    assert.equal(sessionTranscriptHasUserTurn('blank-session'), false);
+    const dir = path.join(home, '.claude', 'projects', '-repo');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'empty-session.jsonl'), '');
+    fs.writeFileSync(path.join(dir, 'worked-session.jsonl'), '{"type":"user"}\n');
+    assert.equal(sessionTranscriptHasUserTurn('empty-session'), false);
+    assert.equal(sessionTranscriptHasUserTurn('worked-session'), true);
+    assert.equal(sessionTranscriptHasUserTurn('../../escape'), false);
   });
 });
 

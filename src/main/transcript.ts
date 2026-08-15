@@ -65,6 +65,30 @@ export function projectDir(cwd: string): string {
  *  crafted id like `../../x` would otherwise traverse out of the project dirs). */
 const VALID_SESSION_ID = /^[A-Za-z0-9_-]+$/;
 
+/** True only when Claude has persisted a user turn for this session id.
+ * SessionStart hooks can record an id before the first user turn, and an empty
+ * transcript file would still not make the session useful to resume. */
+export function sessionTranscriptHasUserTurn(sessionId: string): boolean {
+  try {
+    if (!sessionId || !VALID_SESSION_ID.test(sessionId)) return false;
+    const projectsRoot = path.join(os.homedir(), '.claude/projects');
+    if (!existsSync(projectsRoot)) return false;
+    for (const dir of readdirSync(projectsRoot)) {
+      const file = path.join(projectsRoot, dir, `${sessionId}.jsonl`);
+      if (!existsSync(file)) continue;
+      for (const line of readFileSync(file, 'utf8').split('\n')) {
+        try {
+          const record = JSON.parse(line) as { type?: unknown };
+          if (record.type === 'user') return true;
+        } catch { /* partial/malformed record is not first-turn proof */ }
+      }
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 export function seedSessionTranscript(cwd: string, sessionId: string): boolean {
   try {
     if (!sessionId || !VALID_SESSION_ID.test(sessionId)) return false;
