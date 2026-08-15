@@ -1164,6 +1164,9 @@ export class HiveManager {
     const availabilityLine = meta.isGod
       ? 'AVAILABILITY: Never park your terminal in an unbounded sleep/until/tail/poll loop. Do one bounded check, act, then return to orchestration; Munder scheduler and inbox delivery drive the next turn.'
       : '';
+    const humanAskLine = meta.isGod
+      ? 'HUMAN ASK FORMAT: Write every humanQA question in concise ASD-STE100-style English: active voice, short sentences, one idea per sentence, and no unexplained abbreviations. Use these exact headings in this order: WHAT: the proposed change. WHY: one user or operational benefit. DECISION NEEDED: the exact choice the human must make. RECOMMENDATION: one choice and its reason. OPEN QUESTIONS: only unresolved design questions, or NONE. OPTIONS: short labelled choices with consequences, one option per line. EVIDENCE: document, PR, or task references. ANSWER FORMAT: the shortest sufficient reply. Put the recommendation and open questions before background detail. Do not paste a wall of implementation text.'
+      : '';
     const guardrailsLine = 'Guardrails: a circuit breaker watches the floor — a "Circuit breaker: steer/constrain" message means you are looping or overspending, so STOP repeating, summarize what you tried, and follow it. Be token-frugal (a floor-wide or per-agent token budget can pause you). The shared plan has two parts: board.md (freeform; god is the sole scribe) and tasks.json (structured kanban — todo/doing/blocked/done).';
     const slackLine = meta.isGod
       ? 'SLACK REPLIES: When composing a Slack reply (or writing the `result` field of a Slack-origin kanban card), you MUST: (1) directly address what the user asked — never a bare "done"; (2) include the relevant specifics, outcome, and details; (3) format for Slack mrkdwn — open with a short *bold* headline, use bullet points for multiple items, wrap code/paths in `backtick` blocks, keep it concise (no walls of text). When finishing a Slack-origin task, always write a complete, user-facing, well-formatted `result` on the kanban card — the system posts it verbatim to Slack as the done reply.'
@@ -1183,6 +1186,7 @@ export class HiveManager {
       godLine,
       recoveryLine,
       availabilityLine,
+      humanAskLine,
       slackLine,
       `Env vars available to you: AGENT_ID, AGENT_NAME, HIVE_ROOT, AGENT_DIR.`
     ].filter(Boolean).join('\n');
@@ -2095,6 +2099,23 @@ sessions (they're spawned independently) — \`fleet.json\` is your source of tr
 look at one agent, read its \`agents/<id>/memory.md\` and \`inbox/\`, or send it a \`query\`. A full
 Claude Code command reference (slash = your own session only; CLI = your shell, can target the fleet)
 is in \`COMMANDS.md\` in the hive root.
+
+## Human asks (orchestrator only)
+Write every \`humanQA.q\` in concise ASD-STE100-style English. Use active voice,
+short sentences, one idea per sentence, and no unexplained abbreviations. Use
+these exact headings in this order:
+
+- \`WHAT:\` the proposed change.
+- \`WHY:\` one user or operational benefit.
+- \`DECISION NEEDED:\` the exact choice the human must make.
+- \`RECOMMENDATION:\` one choice and its reason.
+- \`OPEN QUESTIONS:\` only unresolved design questions, or \`NONE\`.
+- \`OPTIONS:\` short labelled choices with consequences, one option per line.
+- \`EVIDENCE:\` document, pull request, or task references.
+- \`ANSWER FORMAT:\` the shortest sufficient reply.
+
+Put the recommendation and open questions before background detail. Do not
+paste a wall of implementation text into the question.
 
 ## Persistent fleet recovery (orchestrator only)
 The god owns routine worker liveness; do not make the human inspect, nudge, or

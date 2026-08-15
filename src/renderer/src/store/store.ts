@@ -7,6 +7,7 @@ import type { AgentProvider } from '@shared/agentProvider';
 import type { HireManifest } from '@shared/hire';
 import { DEFAULT_ORG_TRIGGER, type OrgTriggerConfig, type WebhookTrigger } from '@shared/triggers';
 import { isCompactionCommand } from '@shared/providerAutomation';
+import { upsertQueuedMessage } from '@shared/messageQueue';
 
 export type ToolKind =
   | 'Read' | 'Edit' | 'Write' | 'Bash' | 'WebFetch' | 'WebSearch'
@@ -112,6 +113,15 @@ export interface QueuedMessage {
   text: string;
   /** epoch ms the message was queued — drives ordering and the "queued 2m ago" hint */
   ts: number;
+  /** One refreshable automation delivery, such as the single wake-up that covers
+   * every currently unread hive inbox item. Human messages omit this. */
+  dedupeKey?: string;
+  /** Human-readable provenance. It explains what the delivery represents before
+   * the operator decides to send or cancel it. */
+  source?: {
+    kind: 'hive-inbox' | 'slack' | 'hive' | 'human';
+    label: string;
+  };
   /** Slack-originated: thread coordinates so the office can reply in-thread. */
   slack?: { channel: string; thread_ts: string };
   /** Optional override for the text actually typed into the agent's PTY. When set,
@@ -251,7 +261,12 @@ interface State {
   /** Park a message for an agent. Returns nothing; the flush loop delivers it.
    *  `meta.instruction`, when set, is what gets typed into the PTY instead of
    *  `text` (UI/card surfaces still show `text`). */
-  enqueueMessage: (agentId: string, text: string, meta?: { slack?: { channel: string; thread_ts: string }; instruction?: string }) => void;
+  enqueueMessage: (agentId: string, text: string, meta?: {
+    slack?: { channel: string; thread_ts: string };
+    instruction?: string;
+    dedupeKey?: string;
+    source?: QueuedMessage['source'];
+  }) => void;
   /** Drop a single queued message (user removed it, or it was just delivered). */
   removeQueuedMessage: (agentId: string, messageId: string) => void;
   /** "Send now" while floor auto-delivery is paused: marks the message manual
@@ -743,9 +758,14 @@ export const useStore = create<State>((set) => ({
       const msg: QueuedMessage = {
         id: newQueuedId(), text: trimmed, ts: Date.now(),
         ...(meta?.slack ? { slack: meta.slack } : {}),
-        ...(meta?.instruction ? { instruction: meta.instruction } : {})
+        ...(meta?.instruction ? { instruction: meta.instruction } : {}),
+        ...(meta?.dedupeKey ? { dedupeKey: meta.dedupeKey } : {}),
+        ...(meta?.source ? { source: meta.source } : {}),
       };
-      const messageQueues = { ...s.messageQueues, [agentId]: [...(s.messageQueues[agentId] ?? []), msg] };
+      const messageQueues = {
+        ...s.messageQueues,
+        [agentId]: upsertQueuedMessage(s.messageQueues[agentId] ?? [], msg),
+      };
       persistQueues(messageQueues);
       return { messageQueues };
     }),

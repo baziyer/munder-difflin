@@ -603,18 +603,36 @@ export function useHive(config: HarnessConfig | null): void {
       for (const a of agents) {
         try {
           const inbox = await window.cth.hiveInbox(a.id);
-          // Dedup by the newest message id, not the count — a count can oscillate
-          // as messages drain and re-arrive, which would re-nudge for the same set.
-          const newest = inbox.length
-            ? inbox.map((m) => m.id).sort().slice(-1)[0]
+          // Refresh only when the exact unread set changes. This keeps one visible
+          // wake-up accurate when an older message is handled while the newest id
+          // remains unchanged, without recreating a delivery the operator dismissed.
+          const inboxFingerprint = inbox.length
+            ? inbox.map((m) => m.id).sort().join('\0')
             : '';
-          if (newest && nudged.current[a.id] !== newest) {
+          if (inboxFingerprint && nudged.current[a.id] !== inboxFingerprint) {
+            const visible = [...inbox]
+              .sort((left, right) => right.created_at.localeCompare(left.created_at))
+              .slice(0, 4);
+            const lines = visible.map((msg) =>
+              `- ${msg.from || 'unknown sender'} — ${msg.subject || '(no subject)'}`,
+            );
+            if (inbox.length > visible.length) lines.push(`- +${inbox.length - visible.length} more`);
             useStore.getState().enqueueMessage(
               a.id,
-              'You have new hive inbox message(s) — read your inbox, act on them now, and move handled ones to inbox/.done/. Act autonomously; only message god if you genuinely need a decision.'
+              `Inbox work waiting (${inbox.length}):\n${lines.join('\n')}\n\nRead every inbox item, act on it, and move handled files to inbox/.done/.`,
+              {
+                dedupeKey: 'hive-inbox',
+                source: {
+                  kind: 'hive-inbox',
+                  label: `${inbox.length} unread inbox item${inbox.length === 1 ? '' : 's'}`,
+                },
+              },
             );
-            nudged.current[a.id] = newest;
-          } else if (!newest) {
+            nudged.current[a.id] = inboxFingerprint;
+          } else if (!inboxFingerprint) {
+            const pending = useStore.getState().messageQueues[a.id]
+              ?.find((message) => message.dedupeKey === 'hive-inbox');
+            if (pending) useStore.getState().removeQueuedMessage(a.id, pending.id);
             nudged.current[a.id] = '';
           }
         } catch { /* ignore */ }

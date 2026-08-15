@@ -113,9 +113,33 @@ export interface WebhookOperationalTask {
   createdAt: string;
   startedAt?: string;
   completedAt?: string;
-  question?: { text: string; askedAt?: string };
+  question?: {
+    text: string;
+    askedAt?: string;
+    documents?: WebhookOperationalDocumentRef[];
+  };
   result?: string;
 }
+
+export interface WebhookOperationalDocumentRef {
+  id: string;
+  name: string;
+  reference: string;
+}
+
+export interface WebhookOperationalDocument extends WebhookOperationalDocumentRef {
+  revision: string;
+  content: string;
+}
+
+export interface WebhookDocumentInput {
+  taskId: string;
+  documentId: string;
+}
+
+export type WebhookDocumentResult =
+  | { ok: true; document: WebhookOperationalDocument }
+  | { ok: false; status: 404 | 503; error: string };
 
 export interface WebhookOperationalAgent {
   id: string;
@@ -170,6 +194,11 @@ export interface WebhookServerOptions {
     input: WebhookHumanAnswer,
     endpoint: WebhookEndpointRef,
   ) => WebhookHumanAnswerResult;
+  /** Read one document referenced by the current open human question. */
+  readDocument: (
+    input: WebhookDocumentInput,
+    endpoint: WebhookEndpointRef,
+  ) => WebhookDocumentResult;
 }
 
 /** Reject bodies larger than this before buffering — callers send tiny JSON; the
@@ -208,6 +237,10 @@ export class WebhookServer {
     input: WebhookHumanAnswer,
     endpoint: WebhookEndpointRef,
   ) => WebhookHumanAnswerResult;
+  private readonly readDocument: (
+    input: WebhookDocumentInput,
+    endpoint: WebhookEndpointRef,
+  ) => WebhookDocumentResult;
   /** Compared against when the requested id doesn't exist, purely so the failure
    *  path does the same work as a wrong-secret failure. Random per process and
    *  never exported, so it cannot be matched even by accident. */
@@ -222,6 +255,7 @@ export class WebhookServer {
     this.lookupStatus = opts.lookupStatus;
     this.readSnapshot = opts.readSnapshot;
     this.answerHumanQuestion = opts.answerHumanQuestion;
+    this.readDocument = opts.readDocument;
     this.setEndpoints(opts.endpoints);
   }
 
@@ -347,6 +381,7 @@ export class WebhookServer {
     }
     if (route.resource === 'snapshot') { this.handleSnapshot(req, res, endpoint); return; }
     if (route.resource === 'answer') { this.handleAnswer(req, res, endpoint); return; }
+    if (route.resource === 'document') { this.handleDocument(req, res, endpoint); return; }
     const method = req.method ?? '';
     if (method === 'GET') { this.handleStatus(req, res, endpoint); return; }
     if (method === 'POST') { this.handleCreate(req, res, endpoint); return; }
@@ -413,6 +448,61 @@ export class WebhookServer {
         json(res, 200, { ok: true });
       } catch {
         json(res, 500, { ok: false, error: 'answer could not be recorded' });
+      }
+    });
+    req.on('error', () => {
+      if (!aborted) { try { res.writeHead(400); res.end(); } catch { /* socket gone */ } }
+    });
+  }
+
+  /** Secret-gated document path. The caller supplies an opaque id from the
+   * current snapshot, never a filesystem path. The resolver rechecks that the
+   * document still belongs to the task's latest open question. */
+  private handleDocument(req: IncomingMessage, res: ServerResponse, endpoint: WebhookEndpoint | null): void {
+    if (!this.verifySecret(req, endpoint) || !endpoint) {
+      json(res, 401, { ok: false, error: 'unauthorized' }); return;
+    }
+    if (req.method !== 'POST') { res.writeHead(405); res.end(); return; }
+
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let aborted = false;
+    req.on('data', (chunk: Buffer) => {
+      if (aborted) return;
+      size += chunk.length;
+      if (size > MAX_BODY_BYTES) {
+        aborted = true;
+        json(res, 413, { ok: false, error: 'too large' });
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      if (aborted) return;
+      let parsed: unknown;
+      try { parsed = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
+      catch { json(res, 400, { ok: false, error: 'bad json' }); return; }
+      const body = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        ? parsed as Record<string, unknown>
+        : {};
+      const taskId = typeof body.taskId === 'string' ? body.taskId.trim() : '';
+      const documentId = typeof body.documentId === 'string' ? body.documentId.trim() : '';
+      if (!taskId || taskId.length > MAX_TASK_ID_LENGTH || !/^[a-f0-9]{24}$/.test(documentId)) {
+        json(res, 400, { ok: false, error: 'valid taskId and documentId required' }); return;
+      }
+      try {
+        const result = this.readDocument(
+          { taskId, documentId },
+          { id: endpoint.id, name: endpoint.name },
+        );
+        if (!result.ok) {
+          json(res, result.status, { ok: false, error: result.error });
+          return;
+        }
+        json(res, 200, { ok: true, document: result.document });
+      } catch {
+        json(res, 500, { ok: false, error: 'document could not be read' });
       }
     });
     req.on('error', () => {
@@ -530,7 +620,7 @@ export class WebhookServer {
  */
 function readWebhookRoute(req: IncomingMessage): {
   id: string | null;
-  resource: 'task' | 'snapshot' | 'answer' | 'unknown';
+  resource: 'task' | 'snapshot' | 'answer' | 'document' | 'unknown';
 } {
   let pathname: string;
   try { pathname = new URL(req.url ?? '/', 'http://localhost').pathname; }
@@ -542,6 +632,7 @@ function readWebhookRoute(req: IncomingMessage): {
   if (segments.length === 1) return { id, resource: 'task' };
   if (segments.length === 2 && segments[1] === 'snapshot') return { id, resource: 'snapshot' };
   if (segments.length === 2 && segments[1] === 'answer') return { id, resource: 'answer' };
+  if (segments.length === 2 && segments[1] === 'document') return { id, resource: 'document' };
   return { id: null, resource: 'unknown' };
 }
 
