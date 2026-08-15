@@ -3,7 +3,6 @@ import { spawn } from 'node:child_process';
 import {
   rmSync, existsSync, readFileSync, readdirSync, statSync, cpSync, writeFileSync,
   unlinkSync, mkdirSync, renameSync, createWriteStream, copyFileSync, lstatSync,
-  readlinkSync, symlinkSync
 } from 'node:fs';
 import { randomBytes, createHash, timingSafeEqual } from 'node:crypto';
 import { join, resolve, sep, basename, dirname } from 'node:path';
@@ -36,7 +35,13 @@ import { MemoryManager } from './memory';
 import { KnowledgeManager } from './knowledge';
 import { MemoryReflector, type ReflectSettings } from './reflect';
 import { PersistStore } from './db';
-import { readAgentUsage, readContextTokens, seedSessionTranscript, resolveSessionCwd } from './transcript';
+import {
+  readAgentUsage,
+  readContextTokens,
+  resolveSessionCwd,
+  seedSessionTranscript,
+  sessionTranscriptHasUserTurn,
+} from './transcript';
 import { listIssues, listCIRuns } from './github';
 import { SlackWebhookServer, SlackReplyServer, postSlackReply, type SlackEventFile } from './slack';
 import {
@@ -75,6 +80,7 @@ import * as integrations from './integrations';
 import { validateBaseUrl, buildAuthHeaders, resolveUpstreamUrl, secretRefFor, INTEGRATION_TEMPLATES } from '../shared/integrations';
 import { RosterStore } from './roster';
 import {
+  choosePersistentRecoverySession,
   parsePersistentRecoveryRequest,
   planPersistentRecovery,
   tokenizeSavedCommand,
@@ -105,9 +111,9 @@ import { buildMissingCliScript, chooseInstallRung } from './cliInstall';
 import { detectNodeVersion, nodeIsUsable, resolveNodeInstaller } from './nodeInstall';
 import {
   CODEX_REMOTE_SOCKET_RELATIVE,
-  codexRemoteAliasPath,
   codexRemoteEndpoint,
   codexRemoteSocketFits,
+  ensureCodexRemoteHome,
   withCodexRemoteArgs
 } from '../shared/codexRemote';
 
@@ -182,31 +188,24 @@ async function enableCodexRemoteForSpawn(
   const realHome = opts.env?.CODEX_HOME;
   if (!realHome) return false;
   try {
-    const alias = codexRemoteAliasPath(realHome, agentId);
-    // Bail before touching the filesystem if even the short alias would exceed
-    // sun_path — the daemon would start and then die on bind, and the warning
-    // below names the real reason instead of a generic readiness timeout.
-    if (!codexRemoteSocketFits(alias)) {
-      console.warn('[codex-remote] socket path exceeds sun_path; starting local TUI:', alias);
+    const prepared = ensureCodexRemoteHome(realHome, agentId);
+    if (!prepared.ok) {
+      console.warn('[codex-remote] short home unavailable; starting local TUI:', prepared.error);
       return false;
     }
-    const aliasRoot = dirname(alias);
-    mkdirSync(aliasRoot, { recursive: true });
-    if (existsSync(alias)) {
-      const st = lstatSync(alias);
-      if (!st.isSymbolicLink() || resolve(dirname(alias), readlinkSync(alias)) !== resolve(realHome)) {
-        console.warn('[codex-remote] short home alias is occupied; starting local TUI:', alias);
-        return false;
-      }
-    } else {
-      symlinkSync(realHome, alias, 'dir');
+    const shortHome = prepared.home;
+    // Bail before daemon startup if even the short durable home would exceed
+    // sun_path — the daemon would start and then die on bind, and the warning
+    // below names the real reason instead of a generic readiness timeout.
+    if (!codexRemoteSocketFits(shortHome)) {
+      console.warn('[codex-remote] socket path exceeds sun_path; starting local TUI:', shortHome);
+      return false;
     }
-
-    const socket = join(alias, CODEX_REMOTE_SOCKET_RELATIVE);
+    const socket = join(shortHome, CODEX_REMOTE_SOCKET_RELATIVE);
     const env: NodeJS.ProcessEnv = {
       ...process.env,
       ...(opts.env ?? {}),
-      CODEX_HOME: alias
+      CODEX_HOME: shortHome
     };
     // shellEnv's resolver mirrors PtyManager's (which is private + returns
     // {path, found}); the daemon just needs the best executable path.
@@ -233,8 +232,8 @@ async function enableCodexRemoteForSpawn(
       console.warn('[codex-remote] daemon returned without a control socket; starting local TUI');
       return false;
     }
-    opts.env = { ...(opts.env ?? {}), CODEX_HOME: alias };
-    opts.args = withCodexRemoteArgs(opts.args ?? [], codexRemoteEndpoint(alias));
+    opts.env = { ...(opts.env ?? {}), CODEX_HOME: shortHome };
+    opts.args = withCodexRemoteArgs(opts.args ?? [], codexRemoteEndpoint(shortHome));
     return true;
   } catch (e) {
     console.warn('[codex-remote] setup failed; starting local TUI:',
@@ -259,6 +258,7 @@ const pendingPersistentRecovery = new Map<string, {
   opts: AgentSpawnOptions;
   owner: Electron.WebContents | null;
   recipe: Extract<PersistentRecoveryPlan, { ok: true }>['recipe'];
+  verify: (replacement: { pid: number }) => Promise<{ ok: true } | { ok: false; error: string }>;
   complete: () => void;
   fail: (reason: string) => void;
 }>();
@@ -622,11 +622,7 @@ ptyManager.setExitHandler((id, exitCode) => {
           recovery.fail('the replacement process exited before it could be verified');
           return;
         }
-        const ready = await waitForPersistentAgentReady(
-          recovery.recipe.ptyId,
-          recovery.recipe.id,
-          replacement.pid,
-        );
+        const ready = await recovery.verify(replacement);
         if (ready.ok) recovery.complete();
         else recovery.fail(ready.error);
       })
@@ -4256,7 +4252,9 @@ completionWatcher.start();
 // SAME persistent roster id and recorded CLI session without asking the human to
 // click through Add Agent. Requests are file-based like ephemeral spawn requests,
 // but strictly narrower: an existing non-god id, a CAS expectedSessionId, and a
-// saved roster recipe are all mandatory; fresh-session fallback is forbidden.
+// saved roster recipe are all mandatory. Fresh fallback is forbidden except for
+// a standing Claude identity whose approved assignment is still unread and whose
+// recorded SessionStart never produced a user-turn transcript.
 
 const RECOVERY_TICK_MS = 1_500;
 let recoveryWatchTimer: ReturnType<typeof setInterval> | null = null;
@@ -4308,6 +4306,74 @@ function broadcastRecoveredAgent(
       ...(recipe.worktreePath === cwd ? { worktreePath: recipe.worktreePath } : {}),
     });
   } catch { /* window gone */ }
+}
+
+/** Locate the still-unread, harness-authored assignment that proves a standing
+ * identity never began its first turn. A filename alone is insufficient: the
+ * full envelope must still be the exact god -> worker standing-hire message. */
+function unreadStandingHireAssignmentMatches(
+  agentId: string,
+  expected: { id: string; sha256: string } | undefined,
+): boolean {
+  const root = hive.root();
+  if (!root || !expected) return false;
+  try {
+    const text = readFileSync(
+      join(root, 'agents', agentId, 'inbox', `${expected.id}.json`),
+      'utf8',
+    );
+    if (createHash('sha256').update(text).digest('hex') !== expected.sha256) return false;
+    const raw = JSON.parse(text) as Record<string, unknown>;
+    return raw.id === expected.id
+      && raw.from === 'god'
+      && raw.to === agentId
+      && raw.act === 'request'
+      && typeof raw.conversation === 'string'
+      && raw.conversation.startsWith('standing-hire-')
+      && typeof raw.subject === 'string'
+      && typeof raw.body === 'string';
+  } catch { /* absent/partial inbox is not bootstrap authority */ }
+  return false;
+}
+
+const PERSISTENT_BOOTSTRAP_PROMPT =
+  'Start now: read every unread message in your hive inbox, act on them in order, move handled files to inbox/.done/, and send Michael a progress update.';
+
+/** Submit a first user turn from MAIN. Headless standing hires cannot depend on
+ * a mounted renderer terminal to type their initial prompt. Text and Enter are
+ * separate PTY writes because a combined paste leaves Enter inside the editor. */
+async function submitPersistentBootstrap(ptyId: string): Promise<{ ok: true } | { ok: false; error: string }> {
+  const wrote = ptyManager.write(ptyId, PERSISTENT_BOOTSTRAP_PROMPT);
+  if (!wrote.ok) return { ok: false, error: wrote.error ?? 'bootstrap prompt write failed' };
+  await new Promise<void>((resolveWrite) => setTimeout(resolveWrite, 140));
+  const submitted = ptyManager.write(ptyId, '\r');
+  return submitted.ok
+    ? { ok: true }
+    : { ok: false, error: submitted.error ?? 'bootstrap Enter write failed' };
+}
+
+/** Prove the first turn actually exists, rather than treating an idle TUI frame
+ * or SessionStart hook as readiness. Claude writes its transcript as soon as
+ * the submitted user turn begins; inbox handling is an even stronger signal. */
+async function waitForPersistentFirstTurn(
+  ptyId: string,
+  agentId: string,
+  assignmentId: string,
+  pid: number,
+  timeoutMs = 30_000,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const entry = ptyManager.list().find((candidate) => candidate.id === ptyId);
+    if (!entry || entry.pid !== pid || ptyToAgent.get(ptyId) !== agentId) {
+      return { ok: false, error: 'the process exited before its first turn began' };
+    }
+    if (persistentHireMessageHandled(agentId, assignmentId)) return { ok: true };
+    const sessionId = hive.lastSession(agentId);
+    if (sessionId && sessionTranscriptHasUserTurn(sessionId)) return { ok: true };
+    await new Promise<void>((resolveTurn) => setTimeout(resolveTurn, 250));
+  }
+  return { ok: false, error: 'the bootstrap prompt produced no transcript or inbox progress' };
 }
 
 /** A successful node-pty spawn is necessary but not sufficient: the CLI can
@@ -4414,6 +4480,19 @@ async function processPersistentRecoveryRequest(filePath: string): Promise<void>
     return;
   }
   const provider = inferAgentProvider(command, plan.recipe.provider as AgentProvider | undefined);
+  const bootstrapAssignmentId = parsed.request.blankAssignment?.id ?? null;
+  const exactBlankAssignment = unreadStandingHireAssignmentMatches(
+    plan.recipe.id,
+    parsed.request.blankAssignment,
+  );
+  const freshBootstrap = choosePersistentRecoverySession({
+    provider,
+    standingHire: plan.recipe.standingHire === true,
+    transcriptExists: sessionTranscriptHasUserTurn(plan.sessionId),
+    unreadStandingAssignment: exactBlankAssignment,
+    firstTurnConfirmed: plan.recipe.standingHireFirstTurnConfirmed,
+    explicitLegacyBlank: parsed.request.blankAssignment !== undefined,
+  }) === 'fresh-bootstrap';
   const opts: AgentSpawnOptions = {
     id: plan.recipe.ptyId,
     cwd,
@@ -4422,12 +4501,13 @@ async function processPersistentRecoveryRequest(filePath: string): Promise<void>
     cols: 100,
     rows: 30,
     isolate: false,
-    resume: true,
+    resume: !freshBootstrap,
     // Bind the spawn to the session that passed the planner's compare-and-swap;
     // never re-read a potentially changed registry value during async setup.
-    resumeSessionId: plan.sessionId,
-    // Never turn an operational recovery into a blank replacement session.
-    requireResume: true,
+    ...(!freshBootstrap ? { resumeSessionId: plan.sessionId } : {}),
+    // Never turn an operational recovery into a blank replacement session. The
+    // narrow fresh-bootstrap exception above immediately submits the assignment.
+    requireResume: !freshBootstrap,
     persistentRecovery: true,
     provider,
     hive: {
@@ -4449,8 +4529,10 @@ async function processPersistentRecoveryRequest(filePath: string): Promise<void>
     broadcastRecoveredAgent(plan, command, cwd, originalOwner);
     informGod(
       `[persistent recovery complete] ${plan.recipe.name}`,
-      `${plan.recipe.name} was ${plan.mode === 'restart' ? 'restarted' : 'restored'} under the same id ` +
-      `(${plan.recipe.id}) and recorded session (${plan.sessionId}). Verify inbox consumption, then close any stale fleet-health humanQA.`,
+      freshBootstrap
+        ? `${plan.recipe.name}'s blank pre-turn process was replaced under the same approved identity (${plan.recipe.id}); MAIN submitted the unread standing assignment as a fresh first turn.`
+        : `${plan.recipe.name} was ${plan.mode === 'restart' ? 'restarted' : 'restored'} under the same id ` +
+          `(${plan.recipe.id}) and recorded session (${plan.sessionId}). Verify inbox consumption, then close any stale fleet-health humanQA.`,
     );
   };
   const fail = (reason: string): void => {
@@ -4478,9 +4560,30 @@ async function processPersistentRecoveryRequest(filePath: string): Promise<void>
     archivePersistentRecoveryRequest(filePath, '.failed');
     informGod(
       `[persistent recovery failed] ${plan.recipe.name}`,
-      `${plan.recipe.name} was not replaced with a fresh session: ${reason}. ` +
+      `${plan.recipe.name} was not recovered: ${reason}. ` +
       `The saved recipe and worktree were preserved. Continue the recovery ladder; escalate only a genuine human-only boundary.`,
     );
+  };
+
+  const verifyReady = async (replacement: { pid: number }): Promise<{ ok: true } | { ok: false; error: string }> => {
+    const ready = await waitForPersistentAgentReady(
+      plan.recipe.ptyId,
+      plan.recipe.id,
+      replacement.pid,
+    );
+    if (!ready.ok || !freshBootstrap || !bootstrapAssignmentId) return ready;
+    const submitted = await submitPersistentBootstrap(plan.recipe.ptyId);
+    if (!submitted.ok) return submitted;
+    const firstTurn = await waitForPersistentFirstTurn(
+      plan.recipe.ptyId,
+      plan.recipe.id,
+      bootstrapAssignmentId,
+      replacement.pid,
+    );
+    if (!firstTurn.ok) return firstTurn;
+    return hive.confirmStandingHireFirstTurn(plan.recipe.id)
+      ? { ok: true }
+      : { ok: false, error: 'first-turn proof could not be persisted' };
   };
 
   if (plan.mode === 'restart') {
@@ -4510,6 +4613,7 @@ async function processPersistentRecoveryRequest(filePath: string): Promise<void>
         opts,
         owner: originalOwner,
         recipe: plan.recipe,
+        verify: verifyReady,
         complete: () => settle('success'),
         fail: (reason) => settle('failure', reason),
       });
@@ -4533,7 +4637,7 @@ async function processPersistentRecoveryRequest(filePath: string): Promise<void>
       fail('the replacement process exited before it could be verified');
       return;
     }
-    const ready = await waitForPersistentAgentReady(plan.recipe.ptyId, plan.recipe.id, replacement.pid);
+    const ready = await verifyReady(replacement);
     if (ready.ok) succeed();
     else fail(ready.error);
   } catch (e) {
@@ -4987,8 +5091,15 @@ async function processPersistentHireRequest(filePath: string, raw: unknown): Pro
   }
   const baseAssignmentId = `standing-hire-${parsed.request.id}`;
   const previousAssignmentHandled = persistentHireMessageHandled(recipe.id, baseAssignmentId);
-  const retrySessionId = resumeProvisioning && typeof registryEntry?.sessionId === 'string'
+  const recordedRetrySessionId = resumeProvisioning && typeof registryEntry?.sessionId === 'string'
     ? registryEntry.sessionId.trim()
+    : '';
+  // SessionStart can record an id before Claude receives any user turn. Do not
+  // wedge an authorised hire by requiring `--resume` for a transcript that was
+  // never created; its exact unread assignment remains the durable authority.
+  const retrySessionId = recordedRetrySessionId
+    && (recipe.provider !== 'claude' || sessionTranscriptHasUserTurn(recordedRetrySessionId))
+    ? recordedRetrySessionId
     : '';
   const assignmentId = persistentHireAssignmentId(
     baseAssignmentId,
@@ -5128,6 +5239,7 @@ async function processPersistentHireRequest(filePath: string, raw: unknown): Pro
         capabilities: recipe.capabilities,
         standingHire: true,
         standingHireRequestId: parsed.request.id,
+        standingHireFirstTurnConfirmed: false,
       },
     }, liveWebContents());
   } catch (e) {
@@ -5154,6 +5266,7 @@ async function processPersistentHireRequest(filePath: string, raw: unknown): Pro
   if (!provisionalRegistry
     || provisionalRegistry.standingHire !== true
     || provisionalRegistry.standingHireRequestId !== parsed.request.id
+    || provisionalRegistry.standingHireFirstTurnConfirmed !== false
     || provisionalRegistry.cwd !== controlCwd
     || provisionalRegistry.provider !== recipe.provider) {
     scheduleRetry('durable hive registration could not be verified');
@@ -5164,6 +5277,23 @@ async function processPersistentHireRequest(filePath: string, raw: unknown): Pro
   if (!ready.ok) {
     scheduleRetry(`spawn failed readiness verification — ${ready.error}`);
     return;
+  }
+  if (recipe.provider === 'claude' && persistentHireMessageUnread(recipe.id, assignmentId)) {
+    const submitted = await submitPersistentBootstrap(recipe.ptyId);
+    if (!submitted.ok) {
+      scheduleRetry(`first-turn bootstrap failed — ${submitted.error}`);
+      return;
+    }
+    const firstTurn = await waitForPersistentFirstTurn(
+      recipe.ptyId,
+      recipe.id,
+      assignmentId,
+      spawned.pid,
+    );
+    if (!firstTurn.ok) {
+      scheduleRetry(`first-turn bootstrap failed — ${firstTurn.error}`);
+      return;
+    }
   }
   const completedRoster = completePersistentHireRoster(recipe.id, parsed.request.id);
   if (!completedRoster.ok) {
@@ -5181,6 +5311,7 @@ async function processPersistentHireRequest(filePath: string, raw: unknown): Pro
   if (!committedRegistry
     || committedRegistry.standingHire !== true
     || committedRegistry.standingHireRequestId !== undefined
+    || committedRegistry.standingHireFirstTurnConfirmed !== true
     || committedRegistry.cwd !== controlCwd
     || committedRegistry.provider !== recipe.provider
     || !committedCard

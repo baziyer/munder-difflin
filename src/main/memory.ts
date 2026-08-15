@@ -16,13 +16,13 @@
 import { existsSync, statSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
-import { ensureKilled } from './procKill';
+import { ensureKilled, hardKillTree } from './procKill';
 
 /** Non-memory files `mempalace mine` must not ingest: the Claude Code hooks
  *  config (a large JSON blob that swamps the wake-up digest), the cursor, and
  *  raw inbox/outbox message JSON. `mempalace mine` honors .gitignore, so we drop
  *  one in each agent dir rather than touch the mine command. */
-const MINE_IGNORE_LINES = ['settings.json', 'cursor.json', 'inbox/', 'outbox/'];
+const MINE_IGNORE_LINES = ['settings.json', 'cursor.json', 'inbox/', 'outbox/', '.codex/'];
 
 /** Idempotently ensure `<agentDir>/.gitignore` excludes the non-memory files.
  *  Writes only the missing lines (append-only) so it's safe to call every cycle. */
@@ -63,6 +63,12 @@ export class MemoryManager {
   private initStarted = false;
   /** True while a mineNow() pass is in flight — serializes palace writers. */
   private mining = false;
+  /** A stop/start that overlaps the old pass must mine as soon as it settles. */
+  private mineAfterCurrent = false;
+  /** Every live CLI child belongs to this manager and is stopped on app/home teardown. */
+  private children = new Set<ReturnType<typeof spawn>>();
+  /** Invalidates late completions after stop()/changeHome(). */
+  private generation = 0;
   /** agentId → memory.md mtimeMs at last successful mine (skip unchanged). */
   private lastMined = new Map<string, number>();
 
@@ -165,11 +171,20 @@ export class MemoryManager {
 
   stop(): void {
     if (this.mineTimer) { clearInterval(this.mineTimer); this.mineTimer = null; }
+    this.initStarted = false;
+    this.generation += 1;
+    this.mineAfterCurrent = false;
+    for (const proc of this.children) {
+      try { proc.kill('SIGTERM'); } catch { /* gone */ }
+      if (typeof proc.pid === 'number') hardKillTree(proc.pid);
+    }
+    this.children.clear();
   }
 
   private startMineLoop(): void {
     if (this.mineTimer) return;
-    this.mineNow();
+    if (this.mining) this.mineAfterCurrent = true;
+    else void this.mineNow();
     this.mineTimer = setInterval(() => this.mineNow(), MINE_INTERVAL_MS);
   }
 
@@ -189,31 +204,48 @@ export class MemoryManager {
     let ids: string[];
     try { ids = readdirSync(agentsDir); } catch { return; }
     this.mining = true;
+    const generation = this.generation;
     try {
       for (const id of ids) {
+        if (generation !== this.generation) break;
         const agentDir = join(agentsDir, id);
         const mem = join(agentDir, 'memory.md');
         if (!existsSync(mem)) continue;
         let mtime = 0;
         try { mtime = statSync(mem).mtimeMs; } catch { continue; }
         if (this.lastMined.get(id) === mtime) continue; // unchanged — skip the model load
-        this.lastMined.set(id, mtime);
-        await this.mineAgent(agentDir, id); // one writer at a time
+        const result = await this.mineAgent(agentDir, id, generation); // one writer at a time
+        if (generation !== this.generation || result === 'stopped') break;
+        if (result === 'ok') this.lastMined.set(id, mtime);
+        else this.lastMined.delete(id);
+        // Another Munder instance or a stale child owns the global writer lock.
+        // One failure is enough: do not hammer every agent with the same lock.
+        if (result === 'locked') break;
       }
     } finally {
       this.mining = false;
+      if (this.mineAfterCurrent && this.initStarted) {
+        this.mineAfterCurrent = false;
+        void this.mineNow();
+      }
     }
   }
 
-  private mineAgent(agentDir: string, id: string): Promise<void> {
+  private mineAgent(
+    agentDir: string,
+    id: string,
+    generation: number
+  ): Promise<'ok' | 'locked' | 'failed' | 'stopped'> {
     return new Promise((resolve) => {
       const bin = this.bin();
-      if (!bin) { resolve(); return; }
+      if (!bin) { resolve('failed'); return; }
       ensureMineIgnore(agentDir); // keep settings.json / cursor / messages out of the index
       // stdin closed (mempalace can prompt); mempalace dedups so re-mining is safe.
       const proc = spawn(bin, ['mine', agentDir, '--wing', id, '--agent', id], {
-        env: this.childEnv(), stdio: ['ignore', 'ignore', 'pipe']
+        env: this.childEnv(), stdio: ['ignore', 'ignore', 'pipe'],
+        detached: process.platform !== 'win32'
       });
+      this.children.add(proc);
       let err = '';
       proc.stderr?.on('data', (d) => { err += d.toString(); });
       // Hard ceiling: a wedged mine used to hold its PID forever AND leave
@@ -227,13 +259,20 @@ export class MemoryManager {
       timer.unref?.();
       proc.on('close', (code) => {
         clearTimeout(timer);
+        this.children.delete(proc);
+        if (generation !== this.generation) { resolve('stopped'); return; }
         if (code !== 0) {
           console.error(`[memory] mine ${id} exited ${code}: ${err.slice(-300)}`);
-          this.lastMined.delete(id); // let the next tick retry
+          resolve(/(?:writer\s+lock|held\s+by\s+(?:pid|another\s+writer))/i.test(err) ? 'locked' : 'failed');
+          return;
         }
-        resolve();
+        resolve('ok');
       });
-      proc.on('error', () => { clearTimeout(timer); this.lastMined.delete(id); resolve(); });
+      proc.on('error', () => {
+        clearTimeout(timer);
+        this.children.delete(proc);
+        resolve(generation !== this.generation ? 'stopped' : 'failed');
+      });
     });
   }
 
@@ -249,7 +288,11 @@ export class MemoryManager {
       if (!this.active() || !bin) { resolve({ ok: false, output: '', error: 'semantic memory not active' }); return; }
       let proc: ReturnType<typeof spawn>;
       try {
-        proc = spawn(bin, args, { env: this.childEnv(), stdio: ['ignore', 'pipe', 'pipe'] });
+        proc = spawn(bin, args, {
+          env: this.childEnv(), stdio: ['ignore', 'pipe', 'pipe'],
+          detached: process.platform !== 'win32'
+        });
+        this.children.add(proc);
       } catch (e) {
         resolve({ ok: false, output: '', error: e instanceof Error ? e.message : String(e) });
         return;
@@ -270,10 +313,14 @@ export class MemoryManager {
       }, 120_000);
       timer.unref?.();
       proc.on('close', (code) => {
+        this.children.delete(proc);
         if (code !== 0) settle({ ok: false, output: out, error: (err || `${label} failed`).trim() });
         else settle({ ok: true, output: out });
       });
-      proc.on('error', (e) => settle({ ok: false, output: '', error: e.message }));
+      proc.on('error', (e) => {
+        this.children.delete(proc);
+        settle({ ok: false, output: '', error: e.message });
+      });
     });
   }
 
