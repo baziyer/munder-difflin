@@ -47,6 +47,7 @@ function makeServer(overrides = {}) {
   const seen = [];
   const snapshotSeen = [];
   const answerSeen = [];
+  const documentSeen = [];
   const server = new WebhookServer({
     port: 0,
     endpoints: endpoints(),
@@ -72,9 +73,15 @@ function makeServer(overrides = {}) {
         ? { ok: true }
         : { ok: false, status: 404, error: 'task not found' };
     },
+    readDocument: (input, endpoint) => {
+      documentSeen.push({ input, endpoint });
+      return input.documentId === 'd'.repeat(24)
+        ? { ok: true, document: { id: 'd'.repeat(24), name: 'plan.md', reference: 'hive/plan.md', revision: 'abc123def456', content: '# Plan' } }
+        : { ok: false, status: 404, error: 'document not found' };
+    },
     ...overrides.opts
   });
-  return { server, seen, snapshotSeen, answerSeen };
+  return { server, seen, snapshotSeen, answerSeen, documentSeen };
 }
 
 /** Fire one request through the handler and resolve with `{status, body}`. */
@@ -206,6 +213,26 @@ test('POST /<endpoint>/answer records a bounded human answer without echoing it'
     });
     assert.equal(invalid.status, 400);
   }
+});
+
+test('POST /<endpoint>/document reads only an opaque referenced document', async () => {
+  const { server, documentSeen } = makeServer();
+  const ok = await request(server, {
+    url: '/alpha/document', headers: auth(SECRET_A),
+    body: post({ taskId: 'task-1', documentId: 'd'.repeat(24) }),
+  });
+  assert.equal(ok.status, 200);
+  assert.equal(ok.body.document.content, '# Plan');
+  assert.deepEqual(documentSeen, [{
+    input: { taskId: 'task-1', documentId: 'd'.repeat(24) },
+    endpoint: { id: 'alpha', name: 'Alpha' },
+  }]);
+
+  const arbitraryPath = await request(server, {
+    url: '/alpha/document', headers: auth(SECRET_A),
+    body: post({ taskId: 'task-1', documentId: '/etc/passwd' }),
+  });
+  assert.equal(arbitraryPath.status, 400);
 });
 
 test('setEndpoints revokes one endpoint without touching the others', async () => {

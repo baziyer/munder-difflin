@@ -160,7 +160,7 @@ export function MessageQueueComposer({ agent }: MessageQueueComposerProps) {
   const statusHint = queue.length === 0
     ? null
     : !idle
-    ? `${agent.name} is busy — ${queue.length} queued`
+    ? `${queue.length} message${queue.length === 1 ? '' : 's'} waiting for ${agent.name}'s next turn`
     : deliveryPaused && !queue[0]?.manual
     ? 'held — delivery paused floor-wide'
     : block === 'draft'
@@ -202,7 +202,7 @@ export function MessageQueueComposer({ agent }: MessageQueueComposerProps) {
           fontFamily: 'var(--cth-font-display)',
           fontSize: 9, lineHeight: '12px',
           color: 'var(--cth-ink-700)'
-        }}>QUEUE</span>
+        }}>PENDING MESSAGES</span>
         {queue.length > 0 && (
           <span style={{
             fontSize: 11, padding: '1px 6px 0',
@@ -250,7 +250,7 @@ export function MessageQueueComposer({ agent }: MessageQueueComposerProps) {
         {queue.length > 1 && (
           <button
             onClick={() => clearQueue(agent.id)}
-            title="Clear all queued messages"
+            title="Cancel every pending terminal delivery. Hive inbox files are not deleted."
             style={{
               marginLeft: 'auto', flexShrink: 0, whiteSpace: 'nowrap',
               border: 'none', background: 'transparent', cursor: 'pointer',
@@ -461,6 +461,16 @@ function QueuedMessageRow(
         color: 'var(--cth-ink-500)', lineHeight: '18px', flexShrink: 0
       }}>{`${index + 1}.`}</span>
       <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 2 }}>
+        <div style={{
+          display: 'flex', gap: 6, flexWrap: 'wrap',
+          fontFamily: 'var(--cth-font-ui)', fontSize: 11, lineHeight: '15px',
+          color: 'var(--cth-ink-500)'
+        }}>
+          <strong style={{ color: 'var(--cth-ink-700)', fontWeight: 600 }}>
+            {message.source?.label ?? (message.slack ? 'Slack request' : 'Message from you')}
+          </strong>
+          <span>· {formatQueueAge(message.ts)}</span>
+        </div>
         <div
           ref={bodyRef}
           title={expanded ? undefined : message.text}
@@ -512,7 +522,9 @@ function QueuedMessageRow(
       </div>
       <button
         onClick={onRemove}
-        title="Remove from queue"
+        title={message.source?.kind === 'hive-inbox'
+          ? 'Cancel this terminal wake-up. The underlying hive inbox items remain.'
+          : 'Cancel this pending terminal delivery.'}
         style={{
           flexShrink: 0, border: 'none', background: 'transparent',
           cursor: 'pointer',
@@ -524,6 +536,15 @@ function QueuedMessageRow(
       </button>
     </div>
   );
+}
+
+function formatQueueAge(ts: number): string {
+  const seconds = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+  if (seconds < 60) return 'now';
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ago`;
 }
 
 

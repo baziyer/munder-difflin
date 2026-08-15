@@ -1,10 +1,38 @@
 import type { HiveTask, Registry } from './hive';
+import { createHash } from 'node:crypto';
+import {
+  closeSync,
+  constants,
+  existsSync,
+  fstatSync,
+  openSync,
+  readFileSync,
+  readSync,
+  realpathSync,
+  statSync,
+} from 'node:fs';
+import { basename, isAbsolute, join, relative, sep } from 'node:path';
 import type {
+  WebhookDocumentResult,
   WebhookHumanAnswer,
   WebhookHumanAnswerResult,
   WebhookOperationalSnapshot,
 } from './webhook';
 import { signHumanAnswerReceipt } from './humanAnswerReceipt';
+
+/** Read through an already validated descriptor without allocating from a
+ * mutable file size. One extra byte turns same-inode growth into a rejection. */
+export function readBoundedUtf8(fd: number, maxBytes: number): string {
+  const buffer = Buffer.allocUnsafe(maxBytes + 1);
+  let offset = 0;
+  while (offset < buffer.length) {
+    const count = readSync(fd, buffer, offset, buffer.length - offset, offset);
+    if (count === 0) break;
+    offset += count;
+  }
+  if (offset > maxBytes) throw new Error('document exceeded the read limit');
+  return buffer.subarray(0, offset).toString('utf8');
+}
 
 interface FleetAgent {
   id?: unknown;
@@ -38,6 +66,7 @@ interface SnapshotInput {
   registry: Registry;
   fleet: FleetSnapshot;
   now?: number;
+  documentRoot?: string | null;
   redact: (value: string) => string;
 }
 
@@ -62,6 +91,8 @@ const MAX_ACTIVE_TASKS = 100;
 const MAX_RECENT_DONE = 12;
 const MAX_TEXT = 4_000;
 const MAX_TITLE = 240;
+const MAX_DOCUMENT_BYTES = 128 * 1024;
+const DOCUMENT_PATH = /(?:^|[\s([`])((?:hive\/|agents\/|\/)[A-Za-z0-9._@+~\/-]+\.md)\b/g;
 
 function text(value: unknown, redact: (value: string) => string, max = MAX_TEXT): string {
   if (typeof value !== 'string') return '';
@@ -100,6 +131,54 @@ function taskTimestamp(task: PersistedTask): string {
   return task.completedAt || task.startedAt || task.createdAt || '';
 }
 
+interface InternalDocumentRef {
+  id: string;
+  name: string;
+  reference: string;
+  path: string;
+  dev: number;
+  ino: number;
+}
+
+function documentRefs(
+  taskId: string,
+  question: string,
+  documentRoot: string | null | undefined,
+): InternalDocumentRef[] {
+  if (!documentRoot || !existsSync(documentRoot)) return [];
+  let root: string;
+  try { root = realpathSync(documentRoot); } catch { return []; }
+  const refs: InternalDocumentRef[] = [];
+  const seen = new Set<string>();
+  for (const match of question.matchAll(DOCUMENT_PATH)) {
+    const written = match[1];
+    const candidate = isAbsolute(written)
+      ? written
+      : written.startsWith('hive/')
+        ? join(root, written.slice('hive/'.length))
+        : join(root, written);
+    let path: string;
+    try { path = realpathSync(candidate); } catch { continue; }
+    if (path !== root && !path.startsWith(`${root}${sep}`)) continue;
+    let stat;
+    try { stat = statSync(path); } catch { continue; }
+    if (!stat.isFile() || stat.size > MAX_DOCUMENT_BYTES || !path.toLowerCase().endsWith('.md')) continue;
+    const relativePath = relative(root, path).split(sep).join('/');
+    const reference = `hive/${relativePath}`;
+    if (seen.has(reference)) continue;
+    seen.add(reference);
+    refs.push({
+      id: createHash('sha256').update(`${taskId}\0${reference}`).digest('hex').slice(0, 24),
+      name: basename(path),
+      reference,
+      path,
+      dev: stat.dev,
+      ino: stat.ino,
+    });
+  }
+  return refs.slice(0, 8);
+}
+
 /** Build the small, redacted read model exposed to a trusted webhook dashboard. */
 export function buildOperationalSnapshot(input: SnapshotInput): WebhookOperationalSnapshot {
   const tasks = Array.isArray(input.tasks) ? input.tasks as PersistedTask[] : [];
@@ -128,6 +207,10 @@ export function buildOperationalSnapshot(input: SnapshotInput): WebhookOperation
       return [];
     }
     const question = openQuestion(task);
+    const documents = question
+      ? documentRefs(task.id, question.q, input.documentRoot)
+        .map(({ id, name, reference }) => ({ id, name, reference }))
+      : [];
     const dependsOn = Array.isArray(task.dependsOn)
       ? task.dependsOn
         .filter((id): id is string => typeof id === 'string')
@@ -152,6 +235,7 @@ export function buildOperationalSnapshot(input: SnapshotInput): WebhookOperation
             question: {
               text: text(question.q, input.redact),
               ...(typeof question.askedAt === 'string' ? { askedAt: question.askedAt } : {}),
+              ...(documents.length ? { documents } : {}),
             },
           }
         : {}),
@@ -184,6 +268,51 @@ export function buildOperationalSnapshot(input: SnapshotInput): WebhookOperation
     tasks: snapshotTasks,
     agents,
   };
+}
+
+export function readOperationalDocument(input: {
+  tasks: HiveTask[];
+  taskId: string;
+  documentId: string;
+  documentRoot?: string | null;
+  redact: (value: string) => string;
+}): WebhookDocumentResult {
+  const task = (Array.isArray(input.tasks) ? input.tasks : [])
+    .find((candidate) => candidate?.id === input.taskId) as PersistedTask | undefined;
+  const question = task ? openQuestion(task) : undefined;
+  if (!task || !question) return { ok: false, status: 404, error: 'document not found' };
+  const ref = documentRefs(task.id, question.q, input.documentRoot)
+    .find((candidate) => candidate.id === input.documentId);
+  if (!ref) return { ok: false, status: 404, error: 'document not found' };
+  let fd: number | null = null;
+  try {
+    // Open the exact file without following a final symlink, then compare its
+    // inode with the canonical file validated above. This closes the useful
+    // symlink/replacement race between current-question validation and reading.
+    fd = openSync(ref.path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const opened = fstatSync(fd);
+    if (!opened.isFile()
+      || opened.size > MAX_DOCUMENT_BYTES
+      || opened.dev !== ref.dev
+      || opened.ino !== ref.ino) {
+      throw new Error('document changed during validation');
+    }
+    const raw = readBoundedUtf8(fd, MAX_DOCUMENT_BYTES);
+    return {
+      ok: true,
+      document: {
+        id: ref.id,
+        name: ref.name,
+        reference: ref.reference,
+        revision: createHash('sha256').update(raw).digest('hex').slice(0, 12),
+        content: input.redact(raw),
+      },
+    };
+  } catch {
+    return { ok: false, status: 503, error: 'document unavailable' };
+  } finally {
+    if (fd !== null) { try { closeSync(fd); } catch { /* already closed */ } }
+  }
 }
 
 /** Apply one answer to the latest open human ask, preserving all earlier Q&A. */

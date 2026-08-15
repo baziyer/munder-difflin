@@ -47,6 +47,8 @@ import { SlackWebhookServer, SlackReplyServer, postSlackReply, type SlackEventFi
 import {
   WebhookServer,
   type WebhookDispatch,
+  type WebhookDocumentInput,
+  type WebhookDocumentResult,
   type WebhookEndpointRef,
   type WebhookHumanAnswer,
   type WebhookHumanAnswerResult,
@@ -57,6 +59,7 @@ import {
 import {
   applyHumanAnswer,
   buildOperationalSnapshot,
+  readOperationalDocument,
   type FleetSnapshot,
 } from './webhookOperations';
 import {
@@ -1935,6 +1938,20 @@ function readWebhookOperationalSnapshot(): WebhookOperationalSnapshot {
     tasks,
     registry: hive.registry(),
     fleet,
+    documentRoot: root,
+    redact: redactSecrets,
+  });
+}
+
+/** Resolve one opaque document id against the task's current open question. */
+function readWebhookOperationalDocument(input: WebhookDocumentInput): WebhookDocumentResult {
+  const ledger = hive.tasks() as { tasks?: HiveTask[] };
+  const tasks = Array.isArray(ledger?.tasks) ? ledger.tasks : [];
+  return readOperationalDocument({
+    tasks,
+    taskId: input.taskId,
+    documentId: input.documentId,
+    documentRoot: hive.root(),
     redact: redactSecrets,
   });
 }
@@ -2118,6 +2135,7 @@ async function startWebhookServer(): Promise<{ ok: boolean; url?: string; error?
     lookupStatus: lookupWebhookStatus,
     readSnapshot: readWebhookOperationalSnapshot,
     answerHumanQuestion: answerWebhookHumanQuestion,
+    readDocument: readWebhookOperationalDocument,
   });
   webhookServer = server;
   const res = await server.start();

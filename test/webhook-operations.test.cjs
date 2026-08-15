@@ -2,12 +2,28 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { closeSync, mkdtempSync, mkdirSync, openSync, writeFileSync } = require('node:fs');
+const { join } = require('node:path');
 const loadTs = require('./load-ts.cjs');
 
 const {
   applyHumanAnswer,
-  buildOperationalSnapshot
+  buildOperationalSnapshot,
+  readBoundedUtf8,
+  readOperationalDocument,
 } = loadTs('src/main/webhookOperations.ts');
+
+test('bounded document reads reject one byte beyond the cap', () => {
+  const root = mkdtempSync(join(require('node:os').tmpdir(), 'munder-bounded-document-'));
+  const path = join(root, 'design.md');
+  writeFileSync(path, '12345', 'utf8');
+  const fd = openSync(path, 'r');
+  try {
+    assert.throws(() => readBoundedUtf8(fd, 4), /read limit/);
+  } finally {
+    closeSync(fd);
+  }
+});
 const { verifyHumanAnswerReceipt } = loadTs('src/main/humanAnswerReceipt.ts');
 
 const NOW = Date.parse('2026-08-15T12:00:00.000Z');
@@ -147,4 +163,49 @@ test('applyHumanAnswer fails closed for missing tasks or resolved asks', () => {
     NOW
   );
   assert.deepEqual(resolved.result, { ok: false, status: 409, error: 'task has no open human question' });
+});
+
+test('open questions expose bounded hive design documents by opaque id', () => {
+  const root = mkdtempSync('/tmp/munder-docs-');
+  const designDir = join(root, 'agents', 'angela', 'design');
+  mkdirSync(designDir, { recursive: true });
+  writeFileSync(join(designDir, 'telemetry-plan.md'), '# Plan\n\nSECRET evidence', 'utf8');
+  const tasks = [task({
+    humanQA: [{
+      q: 'WHAT: Add safe telemetry.\nWHY: Find release errors.\nEVIDENCE: hive/agents/angela/design/telemetry-plan.md',
+    }],
+  })];
+  const snapshot = buildOperationalSnapshot({
+    tasks,
+    registry: { godId: null, agents: {} },
+    fleet: {},
+    documentRoot: root,
+    now: NOW,
+    redact: (value) => value.replaceAll('SECRET', '[redacted]'),
+  });
+
+  const ref = snapshot.tasks[0].question.documents[0];
+  assert.equal(ref.name, 'telemetry-plan.md');
+  assert.equal(ref.reference, 'hive/agents/angela/design/telemetry-plan.md');
+  assert.match(ref.id, /^[a-f0-9]{24}$/);
+
+  const result = readOperationalDocument({
+    tasks,
+    taskId: 'task-1',
+    documentId: ref.id,
+    documentRoot: root,
+    redact: (value) => value.replaceAll('SECRET', '[redacted]'),
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.document.content, '# Plan\n\n[redacted] evidence');
+  assert.match(result.document.revision, /^[a-f0-9]{12}$/);
+});
+
+test('document access fails closed outside the current open question', () => {
+  const root = mkdtempSync('/tmp/munder-docs-');
+  const result = readOperationalDocument({
+    tasks: [task()], taskId: 'task-1', documentId: 'a'.repeat(24),
+    documentRoot: root, redact: (value) => value,
+  });
+  assert.deepEqual(result, { ok: false, status: 404, error: 'document not found' });
 });
