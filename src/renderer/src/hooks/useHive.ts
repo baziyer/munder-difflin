@@ -872,10 +872,25 @@ export function useHive(config: HarnessConfig | null): void {
     if (!config?.onboardingComplete) return;
     const offSpawn = window.cth.onHiveAgentSpawned?.((rec) => {
       if (!rec?.id) return;
-      // addAgent is idempotent, but bail early if the renderer already carded it.
-      if (useStore.getState().agents.some((a) => a.id === rec.id)) return;
+      // A standing-hire broadcast also refreshes an existing card: every floor
+      // must carry the main-owned provisioning marker so a later stale roster
+      // flush cannot erase the recoverable transaction.
+      if (useStore.getState().agents.some((a) => a.id === rec.id)) {
+        if (rec.standingHire === true) {
+          useStore.getState().updateAgent(rec.id, {
+            standingHire: true,
+            standingHireRequestId: rec.standingHireRequestId,
+            ...(rec.cwd ? { cwd: rec.cwd } : {}),
+            ...(rec.command ? { command: rec.command } : {}),
+            ...(rec.provider ? { provider: rec.provider as Agent['provider'] } : {}),
+            ...(rec.model ? { model: rec.model } : {}),
+          });
+        }
+        return;
+      }
       const key = (rec.name || rec.id).toLowerCase();
       const character =
+        OFFICE_CAST.find((m) => m.name === rec.character)?.name ??
         OFFICE_CAST.find((m) => m.name === key || m.displayName.toLowerCase() === key)?.name ??
         DEFAULT_CHARACTER;
       let h = 0;
@@ -885,18 +900,25 @@ export function useHive(config: HarnessConfig | null): void {
         id: rec.id,
         name: rec.name || rec.id,
         character,
-        accent: SPAWN_ACCENTS[h],
+        accent: SPAWN_ACCENTS.includes(rec.accent as Agent['accent'])
+          ? rec.accent as Agent['accent']
+          : SPAWN_ACCENTS[h],
         description: rec.role || 'a fresh harness',
         project,
         tmuxTarget: '',
         cwd: rec.cwd,
+        goal: rec.goal,
         status: 'idle',
         action: 'starting up',
         progress: 0,
         currentStation: 'desk',
-        ptyId: rec.id,
+        ptyId: rec.ptyId || rec.id,
         command: rec.command,
         provider: rec.provider as Agent['provider'],
+        model: rec.model,
+        worktreePath: rec.worktreePath,
+        standingHire: rec.standingHire === true,
+        standingHireRequestId: rec.standingHireRequestId,
         isGod: false,
         recentTextTs: Date.now()
       };
@@ -905,7 +927,17 @@ export function useHive(config: HarnessConfig | null): void {
     const offArchive = window.cth.onHiveAgentArchived?.((e) => {
       if (e?.id) useStore.getState().archiveAgent(e.id);
     });
-    return () => { offSpawn?.(); offArchive?.(); };
+    const offRemove = window.cth.onHiveAgentRemoved?.((e) => {
+      if (!e?.id) return;
+      const state = useStore.getState();
+      state.removeAgent(e.id);
+      state.removeArchivedAgent(e.id);
+      state.removeRestorableAgent(e.id);
+    });
+    const offActivate = window.cth.onHiveAgentActivated?.((e) => {
+      if (e?.id) useStore.getState().updateAgent(e.id, { standingHireRequestId: undefined });
+    });
+    return () => { offSpawn?.(); offArchive?.(); offRemove?.(); offActivate?.(); };
   }, [config?.onboardingComplete]);
 
   // 5c) v0.3.4 voice bridge: main stages queue insertions (clear_context) and

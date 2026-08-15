@@ -46,6 +46,8 @@ export interface HiveAgentMeta {
   isGod?: boolean;
   /** Michael's prep assistant — send-only; enriches prompts and forwards them. */
   isAssistant?: boolean;
+  standingHire?: boolean;
+  standingHireRequestId?: string;
 }
 
 export interface HiveMessage {
@@ -137,6 +139,9 @@ export interface HumanQA {
   a?: string;
   askedAt?: string;
   answeredAt?: string;
+  answerSource?: 'webhook' | 'desktop';
+  answerEndpointId?: string;
+  answerReceipt?: string;
 }
 
 /** A card on the task kanban, persisted to hive/tasks.json. */
@@ -800,8 +805,11 @@ const api = {
    *  the floor card from this descriptor since it didn't initiate the hire itself. */
   onHiveAgentSpawned: (
     cb: (rec: {
-      id: string; name: string; provider?: string; cwd: string;
-      command?: string; role?: string; worktreePath?: string;
+      id: string; ptyId?: string; name: string; provider?: string; cwd: string;
+      command?: string; role?: string; goal?: string; model?: string;
+      character?: string; accent?: string; worktreePath?: string;
+      standingHire?: boolean;
+      standingHireRequestId?: string;
     }) => void
   ): (() => void) => {
     const listener = (_e: IpcRendererEvent, payload: Parameters<typeof cb>[0]) => cb(payload);
@@ -814,6 +822,18 @@ const api = {
     const listener = (_e: IpcRendererEvent, payload: { id: string }) => cb(payload);
     ipcRenderer.on('hive:agentArchived', listener);
     return () => ipcRenderer.removeListener('hive:agentArchived', listener);
+  },
+  /** Roll back a provisional standing-hire card that never became live. */
+  onHiveAgentRemoved: (cb: (e: { id: string }) => void): (() => void) => {
+    const listener = (_e: IpcRendererEvent, payload: { id: string }) => cb(payload);
+    ipcRenderer.on('hive:agentRemoved', listener);
+    return () => ipcRenderer.removeListener('hive:agentRemoved', listener);
+  },
+  /** A provisional standing hire reached a live, recoverable PTY. */
+  onHiveAgentActivated: (cb: (e: { id: string }) => void): (() => void) => {
+    const listener = (_e: IpcRendererEvent, payload: { id: string }) => cb(payload);
+    ipcRenderer.on('hive:agentActivated', listener);
+    return () => ipcRenderer.removeListener('hive:agentActivated', listener);
   },
   /** Register a listener for terminal work-order handoffs (#53) — hive mail to a
    *  hookless provider that can't drain an inbox; the renderer types it into the
@@ -965,6 +985,10 @@ const api = {
   /** Overwrite the hive task ledger with the full task list and commit it. */
   hiveWriteTasks: (tasks: HiveTask[]): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('hive:writeTasks', tasks),
+  /** Answer the latest open human ask through main, which atomically records a
+   * signed human-provenance receipt and notifies Michael. */
+  hiveAnswerHumanQuestion: (input: { taskId: string; answer: string }): Promise<{ ok: boolean; status?: number; error?: string }> =>
+    ipcRenderer.invoke('hive:answerHumanQuestion', input),
 
   // ─── Scheduled missions (recurring auto-dispatch) ──────────────────────────
   listMissions: (): Promise<ScheduledMission[]> => ipcRenderer.invoke('missions:list'),

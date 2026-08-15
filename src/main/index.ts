@@ -22,7 +22,13 @@ import {
   addWorktree, removeWorktree, worktreeHasUnintegratedWork, worktreeIsGcSafe,
   getLogGraph, getCommitFiles, getFileAtRev, compareRefs, listWorktrees, checkoutRef
 } from './git';
-import { HiveManager, type AgentMeta, type HiveMessage, type HiveTask } from './hive';
+import {
+  HiveManager,
+  redactSecrets,
+  type AgentMeta,
+  type HiveMessage,
+  type HiveTask,
+} from './hive';
 import { HookServer } from './hooks';
 import { CircuitBreaker, type BreakerInput } from './breaker';
 import type { UsageProvider } from './usage';
@@ -35,8 +41,19 @@ import { listIssues, listCIRuns } from './github';
 import { SlackWebhookServer, SlackReplyServer, postSlackReply, type SlackEventFile } from './slack';
 import {
   WebhookServer,
-  type WebhookDispatch, type WebhookEndpointRef, type WebhookInbound, type WebhookTaskStatus
+  type WebhookDispatch,
+  type WebhookEndpointRef,
+  type WebhookHumanAnswer,
+  type WebhookHumanAnswerResult,
+  type WebhookInbound,
+  type WebhookOperationalSnapshot,
+  type WebhookTaskStatus,
 } from './webhook';
+import {
+  applyHumanAnswer,
+  buildOperationalSnapshot,
+  type FleetSnapshot,
+} from './webhookOperations';
 import {
   classifyInboundKind, isAutoAllowed,
   DEFAULT_CONTEXT_TRIGGER, DEFAULT_ORG_TRIGGER, DEFAULT_TRIGGER_MODE, DEFAULT_WEBHOOK_SCHEMA,
@@ -57,6 +74,21 @@ import { IntegrationBroker } from './integrationBroker';
 import * as integrations from './integrations';
 import { validateBaseUrl, buildAuthHeaders, resolveUpstreamUrl, secretRefFor, INTEGRATION_TEMPLATES } from '../shared/integrations';
 import { RosterStore } from './roster';
+import {
+  parsePersistentRecoveryRequest,
+  planPersistentRecovery,
+  tokenizeSavedCommand,
+  type PersistentRecoveryPlan,
+} from './persistentRecovery';
+import {
+  classifyPersistentHireEnvelope,
+  parsePersistentHireRequest,
+  persistentHireAssignmentId,
+  persistentHireControlCwd,
+  planPersistentHire,
+  protectPersistentHireRosterWrite,
+  type PersistentHirePlan,
+} from './persistentHire';
 import { ControlRegistry } from './control';
 import { fetchHireManifest, readHireManifestFile } from './hire';
 import { parseHireDeepLink, type HireManifest } from '../shared/hire';
@@ -219,6 +251,54 @@ const ptyToAgent = new Map<string, string>();
  *  install disabled) so the freshly-installed CLI launches in the SAME pty/window —
  *  no user click. Cleared the moment it's consumed, so it can never loop installs. */
 const pendingInstallRelaunch = new Map<string, { opts: AgentSpawnOptions; owner: Electron.WebContents | null; bin: string }>();
+/** A planned same-id/session recovery. Unlike ordinary PTY teardown this keeps
+ * the agent identity and worktree bookkeeping intact while the old process exits
+ * and the saved session is relaunched into the same terminal slot. */
+const pendingPersistentRecovery = new Map<string, {
+  state: 'awaiting-exit' | 'relaunching';
+  opts: AgentSpawnOptions;
+  owner: Electron.WebContents | null;
+  recipe: Extract<PersistentRecoveryPlan, { ok: true }>['recipe'];
+  complete: () => void;
+  fail: (reason: string) => void;
+}>();
+/** Agent ids reserved by the recovery controller. Manual/UI spawns are refused
+ * while a same-session handoff is in flight so a healthy concurrent winner can
+ * never be killed or archived by the recovery's failure path. */
+const activePersistentRecoveryAgents = new Set<string>();
+/** Serialize every spawn by both terminal id and hive identity. Standing hires
+ * keep their reservation through readiness + assignment using a main-only Symbol;
+ * renderer IPC cannot forge or clone that capability. */
+interface SpawnReservation {
+  token: symbol;
+  ptyId: string;
+  agentId?: string;
+}
+const spawnReservationsByPty = new Map<string, SpawnReservation>();
+const spawnReservationsByAgent = new Map<string, SpawnReservation>();
+function acquireSpawnReservation(ptyId: string, agentId?: string): SpawnReservation | null {
+  if (spawnReservationsByPty.has(ptyId) || (agentId && spawnReservationsByAgent.has(agentId))) return null;
+  const reservation = { token: Symbol(`spawn:${ptyId}`), ptyId, ...(agentId ? { agentId } : {}) };
+  spawnReservationsByPty.set(ptyId, reservation);
+  if (agentId) spawnReservationsByAgent.set(agentId, reservation);
+  return reservation;
+}
+function ownsSpawnReservation(reservation: SpawnReservation): boolean {
+  return spawnReservationsByPty.get(reservation.ptyId)?.token === reservation.token
+    && (!reservation.agentId || spawnReservationsByAgent.get(reservation.agentId)?.token === reservation.token);
+}
+function releaseSpawnReservation(reservation: SpawnReservation): void {
+  if (spawnReservationsByPty.get(reservation.ptyId)?.token === reservation.token) {
+    spawnReservationsByPty.delete(reservation.ptyId);
+  }
+  if (reservation.agentId && spawnReservationsByAgent.get(reservation.agentId)?.token === reservation.token) {
+    spawnReservationsByAgent.delete(reservation.agentId);
+  }
+}
+/** Once recovery touches a persistent worker's existing worktree, that checkout
+ * becomes preserve-only. A failed resume or later early CLI exit must never turn
+ * recovery into an implicit `git worktree remove --force`. */
+const protectedRecoveryWorktrees = new Set<string>();
 const hive = new HiveManager(
   () => readConfig().harnessHome,
   (channel, payload) => {
@@ -414,7 +494,10 @@ function teardownPty(id: string): void {
     // teardown routes — a worker that finished (controller kill), crashed, or was
     // idle-reaped all land here. Normal agents keep the immediate force-remove.
     const worker = liveWorkers.get(id);
-    if (worker) {
+    if (protectedRecoveryWorktrees.has(id)) {
+      protectedRecoveryWorktrees.delete(id);
+      console.warn(`[recovery] preserving persistent worktree after PTY exit: ${wtPath}`);
+    } else if (worker) {
       liveWorkers.delete(id);
       void finalizeWorkerWorktree(wtPath, origCwd, worker);
     } else {
@@ -516,6 +599,40 @@ function removeWorkerScratch(workerId: string): void {
 // relaunch carries `noAutoInstall`, so the installer can never fire (let alone loop) a
 // second time — a binary that's somehow still missing just spawns and exits normally.
 ptyManager.setExitHandler((id, exitCode) => {
+  const recovery = pendingPersistentRecovery.get(id);
+  if (recovery) {
+    if (recovery.state !== 'awaiting-exit') {
+      pendingPersistentRecovery.delete(id);
+      recovery.fail('the replacement process exited before recovery completed');
+      return;
+    }
+    recovery.state = 'relaunching';
+    // Re-arm the existing terminal grid, then require the exact recorded session.
+    // No teardown here: identity, inbox, memory and any tracked worktree stay put.
+    const owner = recovery.owner && !recovery.owner.isDestroyed() ? recovery.owner : null;
+    try { (owner ?? liveWebContents())?.send(`pty:relaunch:${id}`); } catch { /* window gone */ }
+    void spawnAgentCore(recovery.opts, owner)
+      .then(async (res) => {
+        if (!res.ok) {
+          recovery.fail(res.error ?? 'saved session could not be relaunched');
+          return;
+        }
+        const replacement = ptyManager.list().find((entry) => entry.id === recovery.recipe.ptyId);
+        if (!replacement) {
+          recovery.fail('the replacement process exited before it could be verified');
+          return;
+        }
+        const ready = await waitForPersistentAgentReady(
+          recovery.recipe.ptyId,
+          recovery.recipe.id,
+          replacement.pid,
+        );
+        if (ready.ok) recovery.complete();
+        else recovery.fail(ready.error);
+      })
+      .catch((e) => recovery.fail(e instanceof Error ? e.message : String(e)));
+    return;
+  }
   const pending = pendingInstallRelaunch.get(id);
   if (pending) {
     pendingInstallRelaunch.delete(id);
@@ -1180,6 +1297,14 @@ function liveWebContents(): Electron.WebContents | null {
   return null;
 }
 
+function sendToAllWindows(channel: string, payload: unknown): void {
+  for (const window of allWindows) {
+    try {
+      if (!window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send(channel, payload);
+    } catch { /* a floor closed between the liveness check and send */ }
+  }
+}
+
 // ─── Slack webhook server (Slack message → Michael's queue) ──────────────────
 /** The running Slack ingestion server, or null when disabled/stopped. */
 let slackServer: SlackWebhookServer | null = null;
@@ -1800,6 +1925,107 @@ function lookupWebhookStatus(token: string): WebhookTaskStatus | null {
   return null;
 }
 
+/** Secret-gated operational read model for trusted remote dashboards. */
+function readWebhookOperationalSnapshot(): WebhookOperationalSnapshot {
+  const ledger = hive.tasks() as { tasks?: HiveTask[] };
+  const tasks = Array.isArray(ledger?.tasks) ? ledger.tasks : [];
+  let fleet: FleetSnapshot = {};
+  const root = hive.root();
+  if (root) {
+    try { fleet = JSON.parse(readFileSync(join(root, 'fleet.json'), 'utf8')) as FleetSnapshot; }
+    catch { fleet = {}; }
+  }
+  return buildOperationalSnapshot({
+    tasks,
+    registry: hive.registry(),
+    fleet,
+    redact: redactSecrets,
+  });
+}
+
+const DESKTOP_HUMAN_APPROVAL_REF = 'internal:desktop-human-approval-v1';
+const DESKTOP_HUMAN_APPROVAL_ENDPOINT = 'desktop-ask-me';
+let desktopHumanApprovalSecret: string | undefined;
+
+/** Main-only key for desktop Ask Me answers. It is encrypted at rest through
+ * Electron safeStorage, never put in config/IPC/agent env, and stable across
+ * restarts so previously recorded receipts remain verifiable. */
+function humanApprovalSigningSecret(): string | undefined {
+  if (desktopHumanApprovalSecret) return desktopHumanApprovalSecret;
+  const existing = integrations.getSecret(DESKTOP_HUMAN_APPROVAL_REF);
+  if (existing) {
+    desktopHumanApprovalSecret = existing;
+    return existing;
+  }
+  const generated = randomBytes(32).toString('hex');
+  const stored = integrations.setSecret(DESKTOP_HUMAN_APPROVAL_REF, generated);
+  if (!stored.ok) {
+    console.error('[human approval] desktop signing key unavailable:', stored.error);
+    return undefined;
+  }
+  desktopHumanApprovalSecret = generated;
+  return generated;
+}
+
+function persistAndNotifyHumanAnswer(
+  input: WebhookHumanAnswer,
+  provenance: Parameters<typeof applyHumanAnswer>[3],
+): WebhookHumanAnswerResult {
+  const ledger = hive.tasks() as { tasks?: HiveTask[] };
+  const tasks = Array.isArray(ledger?.tasks) ? ledger.tasks : [];
+  const applied = applyHumanAnswer(tasks, input, Date.now(), provenance);
+  if (!applied.result.ok || !applied.notification) return applied.result;
+
+  hive.writeTasks(applied.tasks);
+  const note = applied.notification;
+  hive.send({
+    to: 'god',
+    act: 'inform',
+    subject: `HUMAN ANSWER on task "${note.title}"`,
+    body: [
+      `The human answered the open question on task ${note.taskId} ("${note.title}"):`,
+      `Q: ${note.question}`,
+      `A: ${note.answer}`,
+      'The answer is also recorded in the card\'s humanQA. Act on it, unblock the card, and continue the work.',
+    ].join('\n'),
+  }, 'human');
+  return applied.result;
+}
+
+/** Minerva and other trusted webhooks answer the same humanQA ledger as the
+ * desktop. The endpoint secret mints transport-specific provenance. */
+function answerWebhookHumanQuestion(
+  input: WebhookHumanAnswer,
+  endpoint: WebhookEndpointRef,
+): WebhookHumanAnswerResult {
+  const configured = enabledWebhookEndpoints().find((candidate) => candidate.id === endpoint.id);
+  if (!configured) return { ok: false, status: 409, error: 'webhook endpoint is no longer enabled' };
+  return persistAndNotifyHumanAnswer(input, {
+    source: 'webhook',
+    endpointId: endpoint.id,
+    endpointSecret: configured.secret,
+  });
+}
+
+function answerDesktopHumanQuestion(input: unknown): WebhookHumanAnswerResult {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    return { ok: false, status: 400, error: 'invalid answer' };
+  }
+  const raw = input as { taskId?: unknown; answer?: unknown };
+  const taskId = typeof raw.taskId === 'string' ? raw.taskId.trim() : '';
+  const answer = typeof raw.answer === 'string' ? raw.answer.trim() : '';
+  if (!taskId || taskId.length > 256 || !answer || answer.length > 4_000) {
+    return { ok: false, status: 400, error: 'taskId and a bounded answer are required' };
+  }
+  const secret = humanApprovalSigningSecret();
+  if (!secret) return { ok: false, status: 503, error: 'desktop approval signing is unavailable' };
+  return persistAndNotifyHumanAnswer({ taskId, answer }, {
+    source: 'desktop',
+    endpointId: DESKTOP_HUMAN_APPROVAL_ENDPOINT,
+    endpointSecret: secret,
+  });
+}
+
 // ─── Webhook done-observer (the OUTBOUND half of the trigger ledger) ─────────
 // Mirrors `pollSlackDoneTasks`: watch the kanban for webhook-origin cards that
 // reach 'done' and write the reply side of the conversation, tagged with the
@@ -1893,7 +2119,9 @@ async function startWebhookServer(): Promise<{ ok: boolean; url?: string; error?
     port: cfg.webhookPort && cfg.webhookPort > 0 ? cfg.webhookPort : WEBHOOK_DEFAULT_PORT,
     endpoints,
     onMessage: handleWebhookMessage,
-    lookupStatus: lookupWebhookStatus
+    lookupStatus: lookupWebhookStatus,
+    readSnapshot: readWebhookOperationalSnapshot,
+    answerHumanQuestion: answerWebhookHumanQuestion,
   });
   webhookServer = server;
   const res = await server.start();
@@ -2343,7 +2571,7 @@ function findCodexHomeForSession(sessionId: string, siblingsRoot: string): strin
 
 /** Spawn options shared by the `pty:spawn` IPC handler and the god-triggered
  *  ephemeral-worker watcher. */
-type AgentSpawnOptions = SpawnOptions & { hive?: AgentMeta; isolate?: boolean; resume?: boolean; requireResume?: boolean; resumeSessionId?: string; provider?: AgentProvider; noAutoInstall?: boolean };
+type AgentSpawnOptions = SpawnOptions & { hive?: AgentMeta; isolate?: boolean; resume?: boolean; requireResume?: boolean; resumeSessionId?: string; provider?: AgentProvider; noAutoInstall?: boolean; persistentRecovery?: boolean; requireHiveProvisioning?: boolean; spawnReservation?: SpawnReservation };
 
 ipcMain.handle('pty:spawn', async (evt, opts: AgentSpawnOptions) => {
   if (!opts || typeof opts.id !== 'string' || typeof opts.cwd !== 'string' || typeof opts.command !== 'string') {
@@ -2362,6 +2590,44 @@ ipcMain.handle('pty:spawn', async (evt, opts: AgentSpawnOptions) => {
  *  no renderer `evt`). `owner` is the window that should receive this PTY's output
  *  (null → the primary window). Behavior-identical to the prior inline handler. */
 async function spawnAgentCore(opts: AgentSpawnOptions, owner: Electron.WebContents | null): Promise<{ ok: boolean; error?: string; cwd?: string; worktreePath?: string; resumeNotFound?: boolean; resumed?: boolean; seedPrompt?: string }> {
+  const agentId = opts.hive?.id;
+  const supplied = opts.spawnReservation;
+  const reservation = supplied ?? acquireSpawnReservation(opts.id, agentId);
+  if (!reservation || reservation.ptyId !== opts.id || reservation.agentId !== agentId || !ownsSpawnReservation(reservation)) {
+    return { ok: false, error: `spawn is already in progress for ${agentId ?? opts.id}` };
+  }
+  // A completed concurrent spawn may have released its setup reservation while
+  // leaving the PTY live. Re-check under our reservation before any worktree or
+  // registry side effects.
+  const livePtys = ptyManager.list();
+  const liveAgentPty = agentId
+    ? [...ptyToAgent].find(([ptyId, ownerId]) =>
+        ownerId === agentId && livePtys.some((entry) => entry.id === ptyId))?.[0]
+    : undefined;
+  // Failed legacy spawns could leave only a map entry behind. It is not a live
+  // owner and must not permanently block an exact-id retry.
+  if (agentId) {
+    for (const [ptyId, ownerId] of [...ptyToAgent]) {
+      if (ownerId === agentId && !livePtys.some((entry) => entry.id === ptyId)) ptyToAgent.delete(ptyId);
+    }
+  }
+  if (livePtys.some((entry) => entry.id === opts.id) || liveAgentPty) {
+    if (!supplied) releaseSpawnReservation(reservation);
+    return { ok: false, error: `PTY or agent is already active for ${agentId ?? opts.id}` };
+  }
+  try {
+    return await spawnAgentCoreReserved(opts, owner);
+  } finally {
+    // A standing-hire transaction supplies and owns a longer-lived reservation;
+    // ordinary UI/realtime/recovery spawns release theirs when setup returns.
+    if (!supplied) releaseSpawnReservation(reservation);
+  }
+}
+
+async function spawnAgentCoreReserved(opts: AgentSpawnOptions, owner: Electron.WebContents | null): Promise<{ ok: boolean; error?: string; cwd?: string; worktreePath?: string; resumeNotFound?: boolean; resumed?: boolean; seedPrompt?: string }> {
+  if (opts.hive?.id && activePersistentRecoveryAgents.has(opts.hive.id) && opts.persistentRecovery !== true) {
+    return { ok: false, error: `agent recovery is already in progress: ${opts.hive.id}` };
+  }
   // ── cwd INGESTION — expand `~` exactly once, here ───────────────────────────
   // This is the single door every agent spawn comes through (`pty:spawn` IPC and
   // the god-triggered ephemeral-worker watcher), so it is where a user-typed
@@ -2513,8 +2779,11 @@ async function spawnAgentCore(opts: AgentSpawnOptions, owner: Electron.WebConten
       // enterprise knowledge store (both no-ops / empty when their flags are off).
       opts.env = { ...(opts.env ?? {}), ...inj.env, ...memory.env(), ...knowledge.env() };
     } catch (e) {
-      // Hive provisioning is best-effort; never block a spawn on it.
       console.error('[hive] ensureAgent failed:', e);
+      if (opts.requireHiveProvisioning === true) {
+        return { ok: false, error: `hive provisioning failed: ${e instanceof Error ? e.message : String(e)}` };
+      }
+      // Ordinary/manual spawns retain the existing best-effort behavior.
     }
   }
   // Long-run guardrails + tiering (Lane A #6.4/#6.6). All additive to the args
@@ -2899,6 +3168,7 @@ ipcMain.handle('config:changeHome', async (_evt, payload: unknown) => {
   try { clearContextTimers(); } catch (e) { console.error('[changeHome] clearContextTimers:', e); }
   try { stopWebhookDoneObserver(); } catch (e) { console.error('[changeHome] stopWebhookDoneObserver:', e); }
   try { stopEphemeralWorkerWatcher(); } catch (e) { console.error('[changeHome] stopWorkerWatcher:', e); }
+  try { stopPersistentRecoveryWatcher(); } catch (e) { console.error('[changeHome] stopRecoveryWatcher:', e); }
   try { integrationBroker.stop(); } catch (e) { console.error('[changeHome] broker.stop:', e); }
   try { hive.stopRouter(); } catch (e) { console.error('[changeHome] stopRouter:', e); }
   try { hookServer.stop(); } catch (e) { console.error('[changeHome] hookServer.stop:', e); }
@@ -3056,7 +3326,7 @@ ipcMain.handle('git:checkout', async (_evt, cwd: unknown, ref: unknown, detach: 
 const roster = new RosterStore(() => readConfig().harnessHome);
 ipcMain.on('roster:readSync', (evt) => { evt.returnValue = roster.read(); });
 ipcMain.handle('roster:read', () => roster.read());
-ipcMain.handle('roster:write', (_evt, snap: unknown) => roster.write(snap));
+ipcMain.handle('roster:write', (_evt, snap: unknown) => roster.write(protectProvisioningRoster(snap)));
 
 // ─── IPC: hive (multi-agent coordination) ───────────────────────────────────
 ipcMain.handle('hive:registry', () => hive.registry());
@@ -3081,6 +3351,10 @@ ipcMain.handle('hive:writeTasks', (_evt, tasks: unknown) => {
   if (!hive.enabled()) return { ok: false, error: 'hive disabled (no harnessHome)' };
   hive.writeTasks(tasks as HiveTask[]);
   return { ok: true };
+});
+ipcMain.handle('hive:answerHumanQuestion', (_evt, input: unknown) => {
+  if (!hive.enabled()) return { ok: false, status: 409, error: 'hive disabled (no harnessHome)' };
+  return answerDesktopHumanQuestion(input);
 });
 ipcMain.handle('hive:setArchived', (_evt, id: unknown, archived: unknown) => {
   if (typeof id !== 'string') return { ok: false, error: 'invalid id' };
@@ -3215,6 +3489,7 @@ function teardownAndQuit(): void {
   try { clearContextTimers(); } catch (e) { console.error('[quit] clearContextTimers:', e); }
   try { stopWebhookDoneObserver(); } catch (e) { console.error('[quit] stopWebhookDoneObserver:', e); }
   try { stopEphemeralWorkerWatcher(); } catch (e) { console.error('[quit] stopWorkerWatcher:', e); }
+  try { stopPersistentRecoveryWatcher(); } catch (e) { console.error('[quit] stopRecoveryWatcher:', e); }
   try { integrationBroker.stop(); } catch (e) { console.error('[quit] broker.stop:', e); }
   try { hive.stopRouter(); } catch (e) { console.error('[quit] stopRouter:', e); }
   try { hookServer.stop(); } catch (e) { console.error('[quit] hookServer.stop:', e); }
@@ -3272,6 +3547,7 @@ ipcMain.handle('app:resetAll', () => {
   try { clearContextTimers(); } catch (e) { console.error('[reset] clearContextTimers:', e); }
   try { stopWebhookDoneObserver(); } catch (e) { console.error('[reset] stopWebhookDoneObserver:', e); }
   try { stopEphemeralWorkerWatcher(); } catch (e) { console.error('[reset] stopWorkerWatcher:', e); }
+  try { stopPersistentRecoveryWatcher(); } catch (e) { console.error('[reset] stopRecoveryWatcher:', e); }
   try { integrationBroker.stop(); } catch (e) { console.error('[reset] broker.stop:', e); }
   try { hive.stopRouter(); } catch (e) { console.error('[reset] stopRouter:', e); }
   try { hookServer.stop(); } catch (e) { console.error('[reset] hookServer.stop:', e); }
@@ -3974,6 +4250,326 @@ ipcMain.handle('realtime:waitFor', (_e, taskId: unknown, timeoutMs: unknown) =>
     : Promise.resolve({ timedOut: true as const, taskId: '' }));
 completionWatcher.start();
 
+// ─── orchestrator-triggered persistent-agent recovery ───────────────────────
+// Michael can already inspect fleet/registry/process/inbox evidence and re-send
+// work through the hive. This queue supplies the one missing rung: resume the
+// SAME persistent roster id and recorded CLI session without asking the human to
+// click through Add Agent. Requests are file-based like ephemeral spawn requests,
+// but strictly narrower: an existing non-god id, a CAS expectedSessionId, and a
+// saved roster recipe are all mandatory; fresh-session fallback is forbidden.
+
+const RECOVERY_TICK_MS = 1_500;
+let recoveryWatchTimer: ReturnType<typeof setInterval> | null = null;
+let recoveryTickRunning = false;
+let recoveryArchiveSeq = 0;
+
+function recoveryRequestsDir(): string | null {
+  const root = hive.root();
+  return root ? join(root, 'recovery-requests') : null;
+}
+
+function archivePersistentRecoveryRequest(filePath: string, sub: '.done' | '.failed'): void {
+  const queue = recoveryRequestsDir();
+  if (!queue) return;
+  try {
+    const dir = join(queue, sub);
+    mkdirSync(dir, { recursive: true });
+    const name = basename(filePath);
+    let destination = join(dir, name);
+    if (existsSync(destination)) {
+      recoveryArchiveSeq += 1;
+      const stem = name.endsWith('.json') ? name.slice(0, -5) : name;
+      destination = join(dir, `${stem}.duplicate-${Date.now()}-${recoveryArchiveSeq}.json`);
+    }
+    renameSync(filePath, destination);
+  } catch (e) {
+    console.error('[recovery] archive request failed:', e);
+  }
+}
+
+function broadcastRecoveredAgent(
+  plan: Extract<PersistentRecoveryPlan, { ok: true }>,
+  executable: string,
+  cwd: string,
+  owner: Electron.WebContents | null,
+): void {
+  const { recipe } = plan;
+  try {
+    const target = owner && !owner.isDestroyed() ? owner : liveWebContents();
+    target?.send('hive:agentSpawned', {
+      id: recipe.id,
+      ptyId: recipe.ptyId,
+      name: recipe.name,
+      provider: recipe.provider ?? inferAgentProvider(executable),
+      cwd,
+      command: recipe.command,
+      role: recipe.description,
+      standingHire: recipe.standingHire === true,
+      ...(recipe.worktreePath === cwd ? { worktreePath: recipe.worktreePath } : {}),
+    });
+  } catch { /* window gone */ }
+}
+
+/** A successful node-pty spawn is necessary but not sufficient: the CLI can
+ * reject a session/trust/config state and exit a moment later. A persistent
+ * start is complete only after the exact PID has produced terminal output and
+ * stayed alive under the expected agent ownership for a short stability window. */
+async function waitForPersistentAgentReady(
+  ptyId: string,
+  agentId: string,
+  pid: number,
+  timeoutMs = 20_000,
+  stableOutputMs = 3_000,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const deadline = Date.now() + timeoutMs;
+  let outputObservedAt = 0;
+  while (Date.now() < deadline) {
+    const entry = ptyManager.list().find((candidate) => candidate.id === ptyId);
+    if (!entry || entry.pid !== pid) {
+      return { ok: false, error: 'the process exited before reaching a stable interactive state' };
+    }
+    if (ptyToAgent.get(ptyId) !== agentId) {
+      return { ok: false, error: 'PTY ownership changed during session resume' };
+    }
+    if (entry.hasOutput) {
+      if (!outputObservedAt) outputObservedAt = Date.now();
+      if (Date.now() - outputObservedAt >= stableOutputMs) return { ok: true };
+    }
+    await new Promise<void>((resolveReady) => setTimeout(resolveReady, 250));
+  }
+  return { ok: false, error: 'the replacement process never reached a stable interactive state' };
+}
+
+async function processPersistentRecoveryRequest(filePath: string): Promise<void> {
+  let raw: unknown;
+  try { raw = JSON.parse(readFileSync(filePath, 'utf8')); }
+  catch {
+    archivePersistentRecoveryRequest(filePath, '.failed');
+    informGod('[persistent recovery rejected] invalid JSON', `Could not parse ${basename(filePath)}.`);
+    return;
+  }
+  const parsed = parsePersistentRecoveryRequest(raw);
+  if (!parsed.ok) {
+    archivePersistentRecoveryRequest(filePath, '.failed');
+    informGod('[persistent recovery rejected]', `${basename(filePath)}: ${parsed.error}.`);
+    return;
+  }
+  const requestName = `${parsed.request.id}.json`;
+  if (basename(filePath) !== requestName) {
+    archivePersistentRecoveryRequest(filePath, '.failed');
+    informGod('[persistent recovery rejected]', `${basename(filePath)} must be named ${requestName}.`);
+    return;
+  }
+  const queue = recoveryRequestsDir();
+  if (queue && existsSync(join(queue, '.done', requestName))) {
+    archivePersistentRecoveryRequest(filePath, '.failed');
+    informGod('[persistent recovery rejected]', `${parsed.request.id}: duplicate of an already completed request.`);
+    return;
+  }
+  const snapshot = roster.read();
+  if (!snapshot) {
+    archivePersistentRecoveryRequest(filePath, '.failed');
+    informGod('[persistent recovery rejected]', `${parsed.request.id}: no readable saved roster.`);
+    return;
+  }
+  const plan = planPersistentRecovery({
+    request: parsed.request,
+    registry: hive.registry(),
+    roster: snapshot,
+    livePtyOwners: new Map(
+      ptyManager.list().map((entry) => [entry.id, ptyToAgent.get(entry.id) ?? '']),
+    ),
+  });
+  if (!plan.ok) {
+    archivePersistentRecoveryRequest(filePath, '.failed');
+    informGod('[persistent recovery rejected]', `${parsed.request.id}: ${plan.error}.`);
+    return;
+  }
+  if (pendingPersistentRecovery.has(plan.recipe.ptyId) || activePersistentRecoveryAgents.has(plan.recipe.id)) {
+    archivePersistentRecoveryRequest(filePath, '.failed');
+    informGod('[persistent recovery rejected]', `${parsed.request.id}: recovery is already in flight for ${plan.recipe.name}.`);
+    return;
+  }
+
+  let argv: string[];
+  try { argv = tokenizeSavedCommand(plan.recipe.command); }
+  catch (e) {
+    archivePersistentRecoveryRequest(filePath, '.failed');
+    informGod('[persistent recovery rejected]', `${parsed.request.id}: ${e instanceof Error ? e.message : String(e)}.`);
+    return;
+  }
+  const [command, ...args] = argv;
+  if (plan.recipe.worktreePath && !existsSync(plan.recipe.worktreePath)) {
+    archivePersistentRecoveryRequest(filePath, '.failed');
+    informGod(
+      '[persistent recovery rejected]',
+      `${parsed.request.id}: saved worktree no longer exists (${plan.recipe.worktreePath}); refusing to run in the shared checkout.`,
+    );
+    return;
+  }
+  const cwd = plan.recipe.worktreePath ?? plan.recipe.cwd;
+  if (!existsSync(cwd)) {
+    archivePersistentRecoveryRequest(filePath, '.failed');
+    informGod('[persistent recovery rejected]', `${parsed.request.id}: saved cwd no longer exists (${cwd}).`);
+    return;
+  }
+  const provider = inferAgentProvider(command, plan.recipe.provider as AgentProvider | undefined);
+  const opts: AgentSpawnOptions = {
+    id: plan.recipe.ptyId,
+    cwd,
+    command,
+    args,
+    cols: 100,
+    rows: 30,
+    isolate: false,
+    resume: true,
+    // Bind the spawn to the session that passed the planner's compare-and-swap;
+    // never re-read a potentially changed registry value during async setup.
+    resumeSessionId: plan.sessionId,
+    // Never turn an operational recovery into a blank replacement session.
+    requireResume: true,
+    persistentRecovery: true,
+    provider,
+    hive: {
+      id: plan.recipe.id,
+      name: plan.recipe.name,
+      provider,
+      cwd,
+      role: plan.recipe.description,
+    },
+  };
+
+  const originalOwner = plan.mode === 'restart' ? ptyManager.owner(plan.recipe.ptyId) : null;
+  activePersistentRecoveryAgents.add(plan.recipe.id);
+  if (plan.recipe.worktreePath) protectedRecoveryWorktrees.add(plan.recipe.ptyId);
+
+  const succeed = (): void => {
+    activePersistentRecoveryAgents.delete(plan.recipe.id);
+    archivePersistentRecoveryRequest(filePath, '.done');
+    broadcastRecoveredAgent(plan, command, cwd, originalOwner);
+    informGod(
+      `[persistent recovery complete] ${plan.recipe.name}`,
+      `${plan.recipe.name} was ${plan.mode === 'restart' ? 'restarted' : 'restored'} under the same id ` +
+      `(${plan.recipe.id}) and recorded session (${plan.sessionId}). Verify inbox consumption, then close any stale fleet-health humanQA.`,
+    );
+  };
+  const fail = (reason: string): void => {
+    activePersistentRecoveryAgents.delete(plan.recipe.id);
+    // Only stop/archive a PTY still owned by THIS recovered identity. If any
+    // unexpected concurrent process won the id, leave it untouched and surface
+    // the failed CAS instead of destroying a healthy, unrelated worker.
+    const live = ptyManager.list().find((entry) => entry.id === plan.recipe.ptyId);
+    const owner = ptyToAgent.get(plan.recipe.ptyId);
+    const ours = owner === plan.recipe.id || (!live && !owner);
+    if (live && owner === plan.recipe.id) {
+      try { ptyManager.kill(plan.recipe.ptyId); } catch { /* already gone */ }
+    }
+    if (ours) {
+      // Run the standard non-destructive cleanup too (broker grant, provider
+      // proxy sidecar, breaker, registry). protectedRecoveryWorktrees makes its
+      // worktree branch preserve-only.
+      teardownPty(plan.recipe.ptyId);
+      protectedRecoveryWorktrees.delete(plan.recipe.ptyId);
+      try {
+        const target = originalOwner && !originalOwner.isDestroyed() ? originalOwner : liveWebContents();
+        target?.send('hive:agentArchived', { id: plan.recipe.id });
+      } catch { /* window gone */ }
+    }
+    archivePersistentRecoveryRequest(filePath, '.failed');
+    informGod(
+      `[persistent recovery failed] ${plan.recipe.name}`,
+      `${plan.recipe.name} was not replaced with a fresh session: ${reason}. ` +
+      `The saved recipe and worktree were preserved. Continue the recovery ladder; escalate only a genuine human-only boundary.`,
+    );
+  };
+
+  if (plan.mode === 'restart') {
+    await new Promise<void>((resolveRecovery) => {
+      let settled = false;
+      const settle = (outcome: 'success' | 'failure', reason?: string): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        pendingPersistentRecovery.delete(plan.recipe.ptyId);
+        if (outcome === 'success') succeed();
+        else fail(reason ?? 'saved session could not be relaunched');
+        resolveRecovery();
+      };
+      // A SIGHUP-resistant child is force-killed by PtyManager after four seconds.
+      // Keep a wider controller bound so a broken node-pty callback cannot wedge
+      // the queue forever. kill() suppresses any late onExit handoff via the PTY
+      // identity guard, while our recovery maps/worktree remain untouched.
+      const timeout = setTimeout(() => {
+        pendingPersistentRecovery.delete(plan.recipe.ptyId);
+        try { ptyManager.kill(plan.recipe.ptyId); } catch { /* already gone */ }
+        settle('failure', 'the old process did not complete the recovery handoff within 30 seconds');
+      }, 30_000);
+      timeout.unref?.();
+      pendingPersistentRecovery.set(plan.recipe.ptyId, {
+        state: 'awaiting-exit',
+        opts,
+        owner: originalOwner,
+        recipe: plan.recipe,
+        complete: () => settle('success'),
+        fail: (reason) => settle('failure', reason),
+      });
+      const killed = ptyManager.requestExit(plan.recipe.ptyId);
+      if (!killed.ok) {
+        pendingPersistentRecovery.delete(plan.recipe.ptyId);
+        settle('failure', killed.error ?? 'old PTY could not be stopped');
+      }
+    });
+    return;
+  }
+
+  try {
+    const res = await spawnAgentCore(opts, null);
+    if (!res.ok) {
+      fail(res.error ?? 'saved session could not be restored');
+      return;
+    }
+    const replacement = ptyManager.list().find((entry) => entry.id === plan.recipe.ptyId);
+    if (!replacement) {
+      fail('the replacement process exited before it could be verified');
+      return;
+    }
+    const ready = await waitForPersistentAgentReady(plan.recipe.ptyId, plan.recipe.id, replacement.pid);
+    if (ready.ok) succeed();
+    else fail(ready.error);
+  } catch (e) {
+    fail(e instanceof Error ? e.message : String(e));
+  }
+}
+
+async function persistentRecoveryTick(): Promise<void> {
+  if (recoveryTickRunning) return;
+  const dir = recoveryRequestsDir();
+  if (!dir) return;
+  recoveryTickRunning = true;
+  try {
+    mkdirSync(dir, { recursive: true });
+    const files = readdirSync(dir).filter((name) => name.endsWith('.json')).sort();
+    // One at a time: recovery is deliberately rare and sequential ordering makes
+    // its lifecycle/audit trail unambiguous.
+    if (files[0]) await processPersistentRecoveryRequest(join(dir, files[0]));
+  } catch (e) {
+    console.error('[recovery] tick failed:', e);
+  } finally {
+    recoveryTickRunning = false;
+  }
+}
+
+function startPersistentRecoveryWatcher(): void {
+  if (recoveryWatchTimer || !hive.enabled()) return;
+  const dir = recoveryRequestsDir();
+  if (dir) { try { mkdirSync(dir, { recursive: true }); } catch { /* noop */ } }
+  recoveryWatchTimer = setInterval(() => { void persistentRecoveryTick(); }, RECOVERY_TICK_MS);
+}
+
+function stopPersistentRecoveryWatcher(): void {
+  if (recoveryWatchTimer) { clearInterval(recoveryWatchTimer); recoveryWatchTimer = null; }
+}
+
 // ─── god-triggered ephemeral Slack workers ──────────────────────────────────
 // god drops a spawn-request JSON into HIVE_ROOT/spawn-requests/; MAIN polls that
 // queue (same cadence + atomic-rename archival as the hive router — reliability
@@ -4000,16 +4596,37 @@ interface SpawnRequest {
   tokenCap?: number;                                   // optional per-worker token cap (advisory P1)
 }
 
+/** True only for the explicit trusted-local standing-hire envelope. Shareable
+ * hire manifests keep their existing review-only behaviour. */
+function isPersistentHireEnvelope(value: unknown): boolean {
+  return classifyPersistentHireEnvelope(value) === 'current';
+}
+
 /** Polling cadence — matches the hive router. */
 const WORKER_TICK_MS = 1500;
 let workerWatchTimer: ReturnType<typeof setInterval> | null = null;
 /** Re-entrancy guard so a slow tick (await spawn / git checks) never overlaps. */
 let workerTickRunning = false;
+const persistentHireRetries = new Map<string, { attempts: number; nextAt: number }>();
 
 /** HIVE_ROOT/spawn-requests — the queue dir god drops requests into. */
 function spawnRequestsDir(): string | null {
   const root = hive.root();
   return root ? join(root, 'spawn-requests') : null;
+}
+
+/** Renderer localStorage is floor-scoped and can be stale. While an approved
+ * standing hire is provisioning, keep its main-authored card/marker intact on
+ * every renderer roster write. Once the queue request and registry marker are
+ * gone, any stale marker from an old floor is stripped instead of resurrected. */
+function protectProvisioningRoster(snap: unknown): unknown {
+  const queue = spawnRequestsDir();
+  return protectPersistentHireRosterWrite({
+    incoming: snap,
+    current: roster.read(),
+    registry: hive.registry(),
+    requestQueued: (requestId) => !!queue && existsSync(join(queue, `${requestId}.json`)),
+  });
 }
 
 /** Move a processed request out of the queue so it's never reprocessed. */
@@ -4024,6 +4641,571 @@ function archiveRequest(filePath: string, sub: '.done' | '.failed'): void {
     // Last resort: delete it so a poison file can't loop forever.
     try { unlinkSync(filePath); } catch { /* noop */ }
     console.error('[worker] archiveRequest failed:', e);
+  }
+}
+
+function persistPersistentHireRoster(
+  plan: Extract<PersistentHirePlan, { ok: true }>,
+  cwd: string,
+  standingHireRequestId?: string,
+): { ok: true } | { ok: false; error: string } {
+  const snapshot = roster.read();
+  if (!snapshot) return { ok: false, error: 'no readable saved roster' };
+  const { recipe } = plan;
+  const card = {
+    id: recipe.id,
+    name: recipe.name,
+    character: recipe.character ?? 'jim',
+    accent: recipe.accent ?? 'sky',
+    description: recipe.description ?? 'a fresh harness',
+    project: basename(recipe.cwd),
+    tmuxTarget: '',
+    cwd,
+    ...(recipe.goal ? { goal: recipe.goal } : {}),
+    status: 'idle',
+    action: 'starting up',
+    progress: 0,
+    currentStation: 'desk',
+    ptyId: recipe.ptyId,
+    command: recipe.command,
+    provider: recipe.provider,
+    ...(recipe.model ? { model: recipe.model } : {}),
+    standingHire: true,
+    ...(standingHireRequestId ? { standingHireRequestId } : {}),
+    recentTextTs: Date.now(),
+  };
+  const withoutId = (entries: unknown[]): unknown[] => entries.filter((entry) =>
+    !entry || typeof entry !== 'object' || Array.isArray(entry)
+      || (entry as { id?: unknown }).id !== recipe.id
+  );
+  const result = roster.write({
+    ...snapshot,
+    agents: [...withoutId(snapshot.agents), card],
+    archived: withoutId(snapshot.archived),
+    restorable: withoutId(snapshot.restorable),
+    selectedId: recipe.id,
+  });
+  return result.ok
+    ? { ok: true }
+    : { ok: false, error: result.error ?? result.skipped ?? 'roster write failed' };
+}
+
+function completePersistentHireRoster(agentId: string, requestId: string): { ok: true } | { ok: false; error: string } {
+  const current = roster.read();
+  if (!current) return { ok: false, error: 'no readable saved roster during completion' };
+  let matched = 0;
+  const clear = (entries: unknown[]): unknown[] => entries.map((entry) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return entry;
+    const card = entry as Record<string, unknown>;
+    if (card.id !== agentId || card.standingHireRequestId !== requestId) return entry;
+    matched += 1;
+    const { standingHireRequestId: _done, ...completed } = card;
+    void _done;
+    return completed;
+  });
+  const completed = {
+    ...current,
+    agents: clear(current.agents),
+    archived: clear(current.archived),
+    restorable: clear(current.restorable),
+  };
+  if (matched !== 1) {
+    return { ok: false, error: `standing-hire roster marker changed during provisioning (matched ${matched})` };
+  }
+  const result = roster.write(completed);
+  return result.ok
+    ? { ok: true }
+    : { ok: false, error: result.error ?? result.skipped ?? 'roster completion write failed' };
+}
+
+/** Remove only the failed hire from the CURRENT roster. Re-reading here is
+ * important: readiness can take several seconds, during which the renderer may
+ * legitimately save unrelated roster changes that a stale snapshot would erase. */
+function removePersistentHireRoster(agentId: string): { ok: true } | { ok: false; error: string } {
+  const current = roster.read();
+  if (!current) return { ok: false, error: 'no readable saved roster during rollback' };
+  const withoutId = (entries: unknown[]): unknown[] => entries.filter((entry) =>
+    !entry || typeof entry !== 'object' || Array.isArray(entry)
+      || (entry as { id?: unknown }).id !== agentId
+  );
+  const agents = withoutId(current.agents);
+  const queues = { ...current.queues };
+  delete queues[agentId];
+  const firstAgentId = (agents[0] as { id?: unknown } | undefined)?.id;
+  const result = roster.write({
+    ...current,
+    agents,
+    archived: withoutId(current.archived),
+    restorable: withoutId(current.restorable),
+    queues,
+    selectedId: current.selectedId === agentId
+      ? (typeof firstAgentId === 'string' ? firstAgentId : null)
+      : current.selectedId,
+  });
+  return result.ok
+    ? { ok: true }
+    : { ok: false, error: result.error ?? result.skipped ?? 'roster rollback failed' };
+}
+
+function persistentHireMessageExists(agentId: string, messageId: string): boolean {
+  const root = hive.root();
+  if (!root) return false;
+  const inbox = join(root, 'agents', agentId, 'inbox');
+  return existsSync(join(inbox, `${messageId}.json`))
+    || existsSync(join(inbox, '.done', `${messageId}.json`));
+}
+
+function persistentHireMessageHandled(agentId: string, messageId: string): boolean {
+  const root = hive.root();
+  return !!root && existsSync(join(root, 'agents', agentId, 'inbox', '.done', `${messageId}.json`));
+}
+
+function persistentHireMessageUnread(agentId: string, messageId: string): boolean {
+  const root = hive.root();
+  return !!root && existsSync(join(root, 'agents', agentId, 'inbox', `${messageId}.json`));
+}
+
+function persistentHireUnreadMessageMatches(
+  agentId: string,
+  expected: Pick<HiveMessage, 'id' | 'to' | 'conversation' | 'act' | 'subject' | 'body'>,
+): boolean {
+  const root = hive.root();
+  if (!root) return false;
+  try {
+    const raw = JSON.parse(readFileSync(
+      join(root, 'agents', agentId, 'inbox', `${expected.id}.json`),
+      'utf8',
+    )) as Record<string, unknown>;
+    return raw.id === expected.id
+      && raw.to === expected.to
+      && raw.from === 'god'
+      && raw.conversation === expected.conversation
+      && raw.act === expected.act
+      && raw.subject === expected.subject
+      && raw.body === expected.body;
+  } catch {
+    return false;
+  }
+}
+
+function persistentHireMessageHistory(agentId: string, baseId: string): Array<{ id: string; handled: boolean }> {
+  const root = hive.root();
+  if (!root) return [];
+  const inbox = join(root, 'agents', agentId, 'inbox');
+  const collect = (dir: string, handled: boolean): Array<{ id: string; handled: boolean }> => {
+    try {
+      return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+        if (!entry.isFile() || !entry.name.endsWith('.json')) return [];
+        const id = entry.name.slice(0, -'.json'.length);
+        return id === baseId || id.startsWith(`${baseId}-retry-`) ? [{ id, handled }] : [];
+      });
+    } catch {
+      return [];
+    }
+  };
+  return [...collect(inbox, false), ...collect(join(inbox, '.done'), true)];
+}
+
+function removeUnreadPersistentHireMessage(agentId: string, messageId: string): boolean {
+  const root = hive.root();
+  if (!root || persistentHireMessageHandled(agentId, messageId)) return false;
+  const path = join(root, 'agents', agentId, 'inbox', `${messageId}.json`);
+  try {
+    if (existsSync(path)) unlinkSync(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function activeStandingHireCount(): number {
+  const registry = hive.registry();
+  return ptyManager.list().filter((entry) => {
+    const agentId = ptyToAgent.get(entry.id);
+    return !!agentId && registry.agents[agentId]?.standingHire === true;
+  }).length;
+}
+
+function broadcastPersistentHireAgent(
+  plan: Extract<PersistentHirePlan, { ok: true }>,
+  cwd: string,
+  standingHireRequestId?: string,
+): void {
+  const { recipe } = plan;
+  sendToAllWindows('hive:agentSpawned', {
+    id: recipe.id,
+    ptyId: recipe.ptyId,
+    name: recipe.name,
+    provider: recipe.provider,
+    model: recipe.model,
+    cwd,
+    command: recipe.command,
+    role: recipe.description,
+    goal: recipe.goal,
+    character: recipe.character,
+    accent: recipe.accent,
+    standingHire: true,
+    standingHireRequestId,
+  });
+}
+
+/** Provision one standing worker only when its exact identity, workspace,
+ * provider/model and isolation choice match a recorded affirmative task answer. */
+async function processPersistentHireRequest(filePath: string, raw: unknown): Promise<void> {
+  const backoff = persistentHireRetries.get(filePath);
+  if (backoff && Date.now() < backoff.nextAt) return;
+  const reject = (reason: string): void => {
+    persistentHireRetries.delete(filePath);
+    informGod('[persistent hire rejected]', `${basename(filePath)}: ${reason}.`);
+    archiveRequest(filePath, '.failed');
+  };
+  const parsed = parsePersistentHireRequest(raw);
+  if (!parsed.ok) { reject(parsed.error); return; }
+  if (basename(filePath) !== `${parsed.request.id}.json`) {
+    reject(`request must be named ${parsed.request.id}.json`);
+    return;
+  }
+  const registrySnapshot = hive.registry();
+  const snapshot = roster.read();
+  const registryEntry = registrySnapshot.agents[parsed.request.agentId];
+  const registryMatchesRequest = registryEntry?.standingHireRequestId === parsed.request.id;
+  if (!snapshot) {
+    if (registryMatchesRequest) {
+      const attempts = (backoff?.attempts ?? 0) + 1;
+      const delayMs = Math.min(15 * 60_000, 30_000 * (2 ** Math.min(attempts - 1, 5)));
+      persistentHireRetries.set(filePath, { attempts, nextAt: Date.now() + delayMs });
+      informGod('[persistent hire blocked]', `${parsed.request.agentId}: no readable saved roster; the authorised request was preserved and will retry.`);
+    } else reject('no readable saved roster');
+    return;
+  }
+  const savedEntry = [...snapshot.agents, ...snapshot.archived, ...snapshot.restorable]
+    .find((entry) => !!entry && typeof entry === 'object' && !Array.isArray(entry)
+      && (entry as { id?: unknown }).id === parsed.request.agentId) as Record<string, unknown> | undefined;
+  const rosterMatchesRequest = savedEntry?.standingHireRequestId === parsed.request.id;
+  const preserveProvisioning = rosterMatchesRequest || registryMatchesRequest;
+  const deferPreflight = (reason: string): void => {
+    const attempts = (persistentHireRetries.get(filePath)?.attempts ?? 0) + 1;
+    const delayMs = Math.min(15 * 60_000, 30_000 * (2 ** Math.min(attempts - 1, 5)));
+    persistentHireRetries.set(filePath, { attempts, nextAt: Date.now() + delayMs });
+    informGod(
+      '[persistent hire blocked]',
+      `${parsed.request.agentId}: ${reason}. The authorised provisioning transaction was preserved and will retry in ${Math.round(delayMs / 1000)}s.`,
+    );
+  };
+  const failPreflight = (reason: string): void => {
+    if (preserveProvisioning) deferPreflight(reason);
+    else reject(reason);
+  };
+  if (!existsSync(parsed.request.cwd)) {
+    failPreflight(`cwd not found (${parsed.request.cwd})`);
+    return;
+  }
+  const config = readConfig();
+  const noLiveIdentity = !ptyManager.list().some((entry) =>
+    entry.id === `pty-${parsed.request.agentId}` || ptyToAgent.get(entry.id) === parsed.request.agentId);
+  const resumeProvisioning = preserveProvisioning
+    && noLiveIdentity
+    && (!savedEntry || rosterMatchesRequest)
+    && (!registryEntry || registryMatchesRequest);
+  const withoutRequestedId = (entries: unknown[]): unknown[] => entries.filter((entry) =>
+    !entry || typeof entry !== 'object' || Array.isArray(entry)
+      || (entry as { id?: unknown }).id !== parsed.request.agentId);
+  const planningRoster = resumeProvisioning ? {
+    ...snapshot,
+    agents: withoutRequestedId(snapshot.agents),
+    archived: withoutRequestedId(snapshot.archived),
+    restorable: withoutRequestedId(snapshot.restorable),
+  } : snapshot;
+  const planningRegistry = resumeProvisioning ? {
+    ...registrySnapshot,
+    agents: Object.fromEntries(Object.entries(registrySnapshot.agents)
+      .filter(([id]) => id !== parsed.request.agentId)),
+  } : registrySnapshot;
+  const taskFile = hive.tasks() as { tasks?: HiveTask[] };
+  const approvalSecrets = new Map(
+    enabledWebhookEndpoints().map((endpoint) => [endpoint.id, endpoint.secret]),
+  );
+  const desktopSecret = humanApprovalSigningSecret();
+  if (desktopSecret) approvalSecrets.set(DESKTOP_HUMAN_APPROVAL_ENDPOINT, desktopSecret);
+  const plan = planPersistentHire({
+    request: parsed.request,
+    registry: planningRegistry,
+    roster: planningRoster,
+    livePtyOwners: new Map(
+      ptyManager.list().map((entry) => [entry.id, ptyToAgent.get(entry.id) ?? '']),
+    ),
+    tasks: Array.isArray(taskFile.tasks) ? taskFile.tasks : [],
+    approvalSecrets,
+    defaultCommand: config.defaultCommand,
+    autoMode: config.autoMode,
+  });
+  if (!plan.ok) { failPreflight(plan.error); return; }
+  if (!ptyManager.isCommandAvailable(plan.recipe.executable)) {
+    failPreflight(`engine CLI "${plan.recipe.executable}" is not installed`);
+    return;
+  }
+
+  const { recipe } = plan;
+  const controlCwd = persistentHireControlCwd(app.getPath('userData'), recipe.id);
+  if (!controlCwd) {
+    failPreflight('safe non-repository control workspace could not be resolved');
+    return;
+  }
+  const controlRoot = dirname(controlCwd);
+  const controlExisted = existsSync(controlCwd);
+  try {
+    mkdirSync(controlRoot, { recursive: true });
+    if (lstatSync(controlRoot).isSymbolicLink()) throw new Error('standing-workers root is a symbolic link');
+    if (controlExisted && lstatSync(controlCwd).isSymbolicLink()) throw new Error('agent control workspace is a symbolic link');
+    if (!resumeProvisioning && controlExisted && readdirSync(controlCwd).length > 0) {
+      throw new Error('fresh agent control workspace contains unexpected files');
+    }
+    mkdirSync(controlCwd, { recursive: true });
+  }
+  catch (e) {
+    failPreflight(`control workspace could not be prepared — ${e instanceof Error ? e.message : String(e)}`);
+    return;
+  }
+  if (await isRepo(controlCwd)) {
+    failPreflight(`control workspace unexpectedly belongs to a git repository (${controlCwd})`);
+    return;
+  }
+  const standingReservation = acquireSpawnReservation(recipe.ptyId, recipe.id);
+  if (!standingReservation) {
+    failPreflight(`agent or PTY is already being provisioned (${recipe.id})`);
+    return;
+  }
+  try {
+  if (!hive.ensureProvisionalMailbox(recipe.id)) {
+    failPreflight('durable mailbox could not be prepared');
+    return;
+  }
+  const persisted = persistPersistentHireRoster(plan, controlCwd, parsed.request.id);
+  if (!persisted.ok) {
+    failPreflight(`durable spawn recipe could not be persisted — ${persisted.error}`);
+    return;
+  }
+  const baseAssignmentId = `standing-hire-${parsed.request.id}`;
+  const previousAssignmentHandled = persistentHireMessageHandled(recipe.id, baseAssignmentId);
+  const retrySessionId = resumeProvisioning && typeof registryEntry?.sessionId === 'string'
+    ? registryEntry.sessionId.trim()
+    : '';
+  const assignmentId = persistentHireAssignmentId(
+    baseAssignmentId,
+    persistentHireMessageHistory(recipe.id, baseAssignmentId),
+    !!retrySessionId,
+  );
+  const assignment: Pick<HiveMessage, 'id' | 'to' | 'conversation' | 'act' | 'subject' | 'body'> = {
+    id: assignmentId,
+    to: recipe.id,
+    conversation: `standing-hire-${parsed.request.id}`,
+    act: 'request',
+    subject: `Authorized standing assignment — ${recipe.name}`,
+    body: `[AUTHORIZED STANDING HIRE]\nApproval: ${plan.approvalEvidence}\nApproved source repo: ${recipe.cwd}\n\n${plan.objective}`
+      + `\n\n[WORKTREE POLICY] Your terminal starts in a non-repository control workspace. Never edit the source checkout directly. Create or reuse one task-specific worktree from main under ${recipe.cwd}; work in a PR and adversarially review it before merge.`,
+  };
+  try {
+    if (!persistentHireMessageExists(recipe.id, assignmentId)) hive.send(assignment, 'god');
+    const assignmentUnread = persistentHireMessageUnread(recipe.id, assignmentId);
+    const exactAssignmentReady = assignmentUnread
+      ? persistentHireUnreadMessageMatches(recipe.id, assignment)
+      : !!retrySessionId && persistentHireMessageHandled(recipe.id, assignmentId);
+    if (!persistentHireMessageExists(recipe.id, assignmentId) || !exactAssignmentReady) {
+      throw new Error('exact assignment was not present in the worker inbox after routing');
+    }
+  } catch (e) {
+    if (preserveProvisioning || previousAssignmentHandled) {
+      deferPreflight(`assignment could not be persisted — ${e instanceof Error ? e.message : String(e)}`);
+      return;
+    }
+    const removed = removePersistentHireRoster(recipe.id);
+    if (!removed.ok) console.error('[persistent hire] pre-spawn roster rollback failed:', removed.error);
+    reject(`assignment could not be persisted — ${e instanceof Error ? e.message : String(e)}`);
+    return;
+  }
+  // Keep the renderer's roster mirror aware of the main-written provisional
+  // card so an unrelated UI save cannot erase the durable recovery recipe.
+  broadcastPersistentHireAgent(plan, controlCwd, parsed.request.id);
+
+  const previousTokenCap = config.agentTokenCaps?.[recipe.id];
+  let tokenCapApplied = false;
+  let spawnedPid: number | undefined;
+  const restoreTokenCap = (): void => {
+    if (!tokenCapApplied) return;
+    try {
+      const current = { ...(readConfig().agentTokenCaps ?? {}) };
+      if (previousTokenCap === undefined) delete current[recipe.id];
+      else current[recipe.id] = previousTokenCap;
+      writeConfig({ agentTokenCaps: current });
+    } catch (e) {
+      console.error('[persistent hire] token-cap rollback failed:', e);
+    }
+    tokenCapApplied = false;
+  };
+  const scheduleRetry = (reason: string): void => {
+    const liveAttempt = ptyManager.list().find((entry) => entry.id === recipe.ptyId);
+    const ownsLiveAttempt = spawnedPid !== undefined
+      && liveAttempt?.pid === spawnedPid
+      && ptyToAgent.get(recipe.ptyId) === recipe.id;
+    if (ownsLiveAttempt) {
+      try { ptyManager.kill(recipe.ptyId); } catch { /* already gone */ }
+      teardownPty(recipe.ptyId);
+    } else if (!liveAttempt && ptyToAgent.get(recipe.ptyId) === recipe.id) {
+      ptyToAgent.delete(recipe.ptyId);
+    }
+    // A process may already have consumed the assignment. Keep the exact
+    // approved request + identity recoverable, restore both provisional markers,
+    // and retry with bounded backoff instead of orphaning or duplicating work.
+    hive.reopenStandingHire(recipe.id, parsed.request.id);
+    const restored = persistPersistentHireRoster(plan, controlCwd, parsed.request.id);
+    if (!restored.ok) console.error('[persistent hire] retry roster marker failed:', restored.error);
+    restoreTokenCap();
+    const attempts = (persistentHireRetries.get(filePath)?.attempts ?? 0) + 1;
+    const delayMs = Math.min(15 * 60_000, 30_000 * (2 ** Math.min(attempts - 1, 5)));
+    persistentHireRetries.set(filePath, { attempts, nextAt: Date.now() + delayMs });
+    informGod(
+      '[persistent hire retry scheduled]',
+      `${recipe.name} did not reach a stable ready state (${reason}). The exact authorised identity and assignment were preserved; Munder will retry automatically in ${Math.round(delayMs / 1000)}s.`,
+    );
+  };
+  const rollbackBeforeConsumption = (reason: string): void => {
+    if (preserveProvisioning) {
+      scheduleRetry(reason);
+      return;
+    }
+    if (previousAssignmentHandled) {
+      // Remove only this attempt's unread retry copy; the original objective was
+      // already consumed, so the identity itself must remain recoverable.
+      removeUnreadPersistentHireMessage(recipe.id, assignmentId);
+      scheduleRetry(reason);
+      return;
+    }
+    if (!removeUnreadPersistentHireMessage(recipe.id, assignmentId)) {
+      scheduleRetry(reason);
+      return;
+    }
+    hive.forgetProvisionalAgent(recipe.id, parsed.request.id);
+    const removed = removePersistentHireRoster(recipe.id);
+    if (!removed.ok) console.error('[persistent hire] roster rollback failed:', removed.error);
+    sendToAllWindows('hive:agentRemoved', { id: recipe.id });
+    restoreTokenCap();
+    reject(reason);
+  };
+  if (recipe.tokenCap) {
+    try {
+      writeConfig({
+        agentTokenCaps: { ...(readConfig().agentTokenCaps ?? {}), [recipe.id]: recipe.tokenCap },
+      });
+      tokenCapApplied = true;
+    } catch (e) {
+      rollbackBeforeConsumption(`approved token cap could not be persisted — ${e instanceof Error ? e.message : String(e)}`);
+      return;
+    }
+  }
+
+  let res: Awaited<ReturnType<typeof spawnAgentCore>>;
+  try {
+    res = await spawnAgentCore({
+      id: recipe.ptyId,
+      cwd: controlCwd,
+      command: recipe.executable,
+      args: [...recipe.args],
+      cols: 100,
+      rows: 30,
+      isolate: false,
+      spawnReservation: standingReservation,
+      requireHiveProvisioning: true,
+      resume: !!retrySessionId,
+      requireResume: !!retrySessionId,
+      ...(retrySessionId ? { resumeSessionId: retrySessionId } : {}),
+      provider: recipe.provider,
+      hive: {
+        id: recipe.id,
+        name: recipe.name,
+        provider: recipe.provider,
+        cwd: controlCwd,
+        role: recipe.description,
+        capabilities: recipe.capabilities,
+        standingHire: true,
+        standingHireRequestId: parsed.request.id,
+      },
+    }, liveWebContents());
+  } catch (e) {
+    const live = ptyManager.list().find((entry) => entry.id === recipe.ptyId);
+    if (live && ptyToAgent.get(recipe.ptyId) === recipe.id) {
+      spawnedPid = live.pid;
+      scheduleRetry(`spawn threw after process start — ${e instanceof Error ? e.message : String(e)}`);
+    } else {
+      rollbackBeforeConsumption(`spawn threw during provisional setup — ${e instanceof Error ? e.message : String(e)}`);
+    }
+    return;
+  }
+  if (!res.ok) {
+    rollbackBeforeConsumption(`spawn failed — ${res.error ?? 'unknown error'}`);
+    return;
+  }
+  const spawned = ptyManager.list().find((entry) => entry.id === recipe.ptyId);
+  spawnedPid = spawned?.pid;
+  if (!spawned) {
+    scheduleRetry('spawned process disappeared before readiness verification');
+    return;
+  }
+  const provisionalRegistry = hive.registry().agents[recipe.id];
+  if (!provisionalRegistry
+    || provisionalRegistry.standingHire !== true
+    || provisionalRegistry.standingHireRequestId !== parsed.request.id
+    || provisionalRegistry.cwd !== controlCwd
+    || provisionalRegistry.provider !== recipe.provider) {
+    scheduleRetry('durable hive registration could not be verified');
+    return;
+  }
+  const cwd = res.cwd ?? controlCwd;
+  const ready = await waitForPersistentAgentReady(recipe.ptyId, recipe.id, spawned.pid);
+  if (!ready.ok) {
+    scheduleRetry(`spawn failed readiness verification — ${ready.error}`);
+    return;
+  }
+  const completedRoster = completePersistentHireRoster(recipe.id, parsed.request.id);
+  if (!completedRoster.ok) {
+    scheduleRetry(`spawn could not commit its roster marker — ${completedRoster.error}`);
+    return;
+  }
+  if (!hive.completeStandingHire(recipe.id, parsed.request.id)) {
+    scheduleRetry('standing-hire registry marker changed during provisioning');
+    return;
+  }
+  const committedRegistry = hive.registry().agents[recipe.id];
+  const committedCard = roster.read()?.agents.find((entry) =>
+    !!entry && typeof entry === 'object' && !Array.isArray(entry)
+      && (entry as Record<string, unknown>).id === recipe.id) as Record<string, unknown> | undefined;
+  if (!committedRegistry
+    || committedRegistry.standingHire !== true
+    || committedRegistry.standingHireRequestId !== undefined
+    || committedRegistry.cwd !== controlCwd
+    || committedRegistry.provider !== recipe.provider
+    || !committedCard
+    || committedCard.standingHire !== true
+    || committedCard.standingHireRequestId !== undefined) {
+    scheduleRetry('standing-hire durable commit could not be verified');
+    return;
+  }
+  sendToAllWindows('hive:agentActivated', { id: recipe.id });
+  broadcastPersistentHireAgent(plan, cwd);
+  persistentHireRetries.delete(filePath);
+  hive.appendLog({
+    kind: 'persistent-hire',
+    requestId: parsed.request.id,
+    agentId: recipe.id,
+    approvalTaskId: parsed.request.approval.taskId,
+    approvalAnsweredAt: parsed.request.approval.answeredAt,
+  });
+  archiveRequest(filePath, '.done');
+  informGod(
+    `[persistent hire complete] ${recipe.name}`,
+    `${recipe.name} is active as ${recipe.id}; the approved standing assignment was delivered without a human UI step.`,
+  );
+  } finally {
+    releaseSpawnReservation(standingReservation);
   }
 }
 
@@ -4070,15 +5252,28 @@ function workerSignaledDone(workerId: string, spawnedAt: number): boolean {
  *  registered (for done-scan / reaping / safe teardown) and dispatched its
  *  objective via the standard inbox path. */
 async function processSpawnRequest(filePath: string): Promise<void> {
-  let raw: SpawnRequest;
+  let rawValue: unknown;
   try {
-    raw = JSON.parse(readFileSync(filePath, 'utf8')) as SpawnRequest;
+    rawValue = JSON.parse(readFileSync(filePath, 'utf8')) as unknown;
   } catch (e) {
     console.error('[worker] unparseable spawn-request:', filePath, e);
     informGod('[worker spawn rejected] unparseable request', `Could not parse spawn-request ${basename(filePath)} — ${String(e)}`);
     archiveRequest(filePath, '.failed');
     return;
   }
+  if (isPersistentHireEnvelope(rawValue)) {
+    await processPersistentHireRequest(filePath, rawValue);
+    return;
+  }
+  if (classifyPersistentHireEnvelope(rawValue) === 'unknown') {
+    informGod(
+      '[persistent hire rejected]',
+      `${basename(filePath)}: unsupported persistent-hire spec; the request was not run as an ephemeral worker.`,
+    );
+    archiveRequest(filePath, '.failed');
+    return;
+  }
+  const raw = rawValue as SpawnRequest;
   const slack = raw.slack && typeof raw.slack.channel === 'string' && typeof raw.slack.thread_ts === 'string'
     ? { channel: raw.slack.channel, thread_ts: raw.slack.thread_ts } : undefined;
   const fail = (reason: string): void => {
@@ -4173,7 +5368,11 @@ async function processSpawnRequest(filePath: string): Promise<void> {
  *  (default-off) per-worker token cap. */
 function workerTokensUsed(workerId: string): number {
   const s = usageProvider.getAgentUsage(workerId);
-  return s ? s.input + s.output + s.cacheRead + s.cacheCreation : 0;
+  // The transcript fallback aggregates every Claude transcript sharing a cwd.
+  // It has no live session id and previously made a fresh worker in a shared cwd
+  // inherit Michael/Jim/Toby's historical total and get reaped immediately.
+  // Enforce caps only on telemetry attributed to this live worker session.
+  return s?.sessionId ? s.input + s.output + s.cacheRead + s.cacheCreation : 0;
 }
 
 /** Throttle for the GC sweep — git checks are cheap but pointless every 1.5s tick. */
@@ -4248,6 +5447,7 @@ async function ephemeralWorkerTick(): Promise<void> {
         rec.releasing = true;
         console.log(`[worker] ${workerId} signaled done — releasing`);
         ptyManager.kill(workerId);
+        teardownPty(workerId);
         continue;
       }
       // Token-cap reap (default-off plumbing). An effective cap > 0 → reap when the
@@ -4264,6 +5464,7 @@ async function ephemeralWorkerTick(): Promise<void> {
             rec.slack
           );
           ptyManager.kill(workerId);
+          teardownPty(workerId);
           continue;
         }
       }
@@ -4278,6 +5479,7 @@ async function ephemeralWorkerTick(): Promise<void> {
           rec.slack
         );
         ptyManager.kill(workerId);
+        teardownPty(workerId);
       }
     }
 
@@ -4288,7 +5490,10 @@ async function ephemeralWorkerTick(): Promise<void> {
       let files: string[] = [];
       try { files = readdirSync(dir).filter(f => f.endsWith('.json')).sort(); } catch { /* dir vanished */ }
       for (const f of files) {
-        if (liveWorkers.size >= maxWorkers) break;
+        // Standing hires and ephemeral workers share the queue admission cap.
+        // A successful standing hire is already in the durable roster before
+        // this loop advances, so a batch cannot escape the configured ceiling.
+        if (liveWorkers.size + activeStandingHireCount() >= maxWorkers) break;
         await processSpawnRequest(join(dir, f));
       }
     }
@@ -4381,7 +5586,9 @@ ipcMain.handle('workers:stop', (_evt, workerId: string): { ok: boolean; error?: 
   if (rec.releasing) return { ok: true }; // already stopping
   rec.releasing = true;
   console.log(`[worker] manual stop requested for ${workerId}`);
-  try { ptyManager.kill(workerId); } catch (e) { return { ok: false, error: String(e) }; }
+  try { ptyManager.kill(workerId); }
+  catch (e) { teardownPty(workerId); return { ok: false, error: String(e) }; }
+  teardownPty(workerId);
   return { ok: true };
 });
 
@@ -4395,6 +5602,7 @@ function bootstrapHiveServices(): void {
   archiveOrphanedAgents(); // #57/#58: archive stale archived:false entries with no live PTY
   hive.startRouter();
   startEphemeralWorkerWatcher(); // poll HIVE_ROOT/spawn-requests → ephemeral workers
+  startPersistentRecoveryWatcher(); // poll HIVE_ROOT/recovery-requests → same-id/session recovery
   // Phase 2: the loopback secret broker. Bind it BEFORE workers spawn so each spawn can
   // be granted a capability token + the broker URL in its env. Loopback-only, idempotent.
   void integrationBroker.start().then((r) => {

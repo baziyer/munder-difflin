@@ -72,30 +72,12 @@ export function AskMeTab() {
     if (!text || !open || sending) return;
     setSending(task.id);
     try {
-      // 1) Document the answer ON the card.
-      const next = tasks.map((t) => {
-        if (t.id !== task.id) return t;
-        const qa = (t.humanQA ?? []).map((e) =>
-          e === open || (e.q === open.q && !e.a)
-            ? { ...e, a: text, answeredAt: new Date().toISOString() }
-            : e
-        );
-        return { ...t, humanQA: qa };
-      });
-      await window.cth.hiveWriteTasks(next);
-      setTasks(next);
-      // 2) Tell the god, so the card gets unblocked and work continues.
-      await window.cth.hiveSend({
-        to: 'god',
-        act: 'inform',
-        subject: `HUMAN ANSWER on task "${task.title}"`,
-        body: [
-          `The human answered the open question on task ${task.id} ("${task.title}"):`,
-          `Q: ${open.q}`,
-          `A: ${text}`,
-          'The answer is also recorded in the card\'s humanQA. Act on it, unblock the card, and continue the work.'
-        ].join('\n')
-      }, 'human');
+      // Main performs one trusted answer operation: persist the answer with a
+      // signed desktop-human receipt, then notify Michael. This is the same
+      // ledger operation Minerva's authenticated /answer route uses.
+      const result = await window.cth.hiveAnswerHumanQuestion({ taskId: task.id, answer: text });
+      if (!result.ok) throw new Error(result.error ?? 'answer failed');
+      await refresh();
       setAnswerDraft(task.id, '');
     } catch { /* leave the draft so the user can retry */ }
     setSending(null);

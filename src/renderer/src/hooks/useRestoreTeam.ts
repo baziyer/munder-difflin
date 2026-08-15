@@ -98,6 +98,10 @@ export function useRestoreTeam(config?: HarnessConfig | null): RestoreTeamState 
         // abort the others — an unhandled rejection here used to make the
         // entire restore a silent no-op after the first bad agent.
         try {
+          if (a.standingHireRequestId) {
+            failures.push(`${a.name}: approved standing hire is being reconciled by Munder`);
+            return null;
+          }
           const provider = inferAgentProvider(a.command, a.provider);
           const command = (a.command ?? '').trim() || (config ? buildSpawnCommand(config, a.model, provider) : '');
           if (!command || !a.cwd) {
@@ -124,6 +128,10 @@ export function useRestoreTeam(config?: HarnessConfig | null): RestoreTeamState 
             if (await window.cth.gitIsRepo(a.worktreePath)) {
               cwd = a.worktreePath;
             } else {
+              if (a.standingHire) {
+                failures.push(`${a.name}: approved worktree is missing; shared-checkout fallback refused`);
+                return null;
+              }
               worktreeGone = true;
               console.warn(`[restore] worktree gone for ${a.id} (${a.worktreePath}); falling back to base repo ${a.cwd}`);
             }
@@ -146,7 +154,7 @@ export function useRestoreTeam(config?: HarnessConfig | null): RestoreTeamState 
             // agent id is preserved across restart, so its registry entry,
             // memory.md and inbox reattach by id. No-op without a recorded session.
             resume: true,
-            hive: { id: a.id, name: a.name, provider, cwd, role: a.description }
+            hive: { id: a.id, name: a.name, provider, cwd, role: a.description, standingHire: a.standingHire }
           });
           if (res.ok) {
             restored++;

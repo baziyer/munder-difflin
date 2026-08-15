@@ -439,6 +439,24 @@ export class PtyManager {
     }
   }
 
+  /** Stop a PTY for an in-place relaunch while keeping its session record until
+   * node-pty confirms exit. Unlike kill(), this deliberately does NOT delete the
+   * map entry early: onExit must reach the registered exit handler, which owns
+   * the same-id/session recovery handoff. The normal identity guard still drops
+   * stale output, and ensureKilled supplies the bounded hard-kill fallback. */
+  requestExit(id: string): { ok: boolean; error?: string } {
+    const s = this.sessions.get(id);
+    if (!s) return { ok: false, error: `no pty: ${id}` };
+    try {
+      const pid = s.proc.pid;
+      s.proc.kill();
+      ensureKilled(pid);
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  }
+
   list(): Array<{ id: string; cwd: string; command: string; pid: number; lastOutputAt: number; hasOutput: boolean }> {
     return Array.from(this.sessions.values()).map(s => ({
       id: s.id,
@@ -448,6 +466,12 @@ export class PtyManager {
       lastOutputAt: s.lastOutputAt,
       hasOutput: s.hasOutput
     }));
+  }
+
+  /** Window that owns a live terminal. Recovery reuses this so an in-place
+   * restart cannot move a secondary-floor agent's output to the primary floor. */
+  owner(id: string): WebContents | null {
+    return this.sessions.get(id)?.owner ?? null;
   }
 
   /** Epoch ms of this PTY's most recent output, or undefined if no such PTY. */

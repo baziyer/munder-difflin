@@ -12,6 +12,10 @@
  *         mode holds it for the operator. Either way the caller gets its token.
  *   - GET  /<webhookId>  + `x-md-webhook-token: <token>` (or `?token=`)
  *       → returns ONLY that token's task status: `{ ok, status, title, result? }`.
+ *   - GET  /<webhookId>/snapshot + `x-md-webhook-secret: <secret>`
+ *       → returns a bounded, redacted operational view of the hive.
+ *   - POST /<webhookId>/answer + `x-md-webhook-secret: <secret>`
+ *       + `{ taskId, answer }` → records one answer to an existing human ask.
  *   - POST / (bare) is an alias for the endpoint with id `legacy`, so a caller
  *     holding the pre-multi-endpoint URL keeps working across the upgrade.
  *
@@ -99,6 +103,49 @@ export interface WebhookTaskStatus {
   result?: string;
 }
 
+export interface WebhookOperationalTask {
+  id: string;
+  title: string;
+  status: 'todo' | 'doing' | 'blocked' | 'done';
+  assignee?: string;
+  dependsOn: string[];
+  priority: number;
+  createdAt: string;
+  startedAt?: string;
+  completedAt?: string;
+  question?: { text: string; askedAt?: string };
+  result?: string;
+}
+
+export interface WebhookOperationalAgent {
+  id: string;
+  name: string;
+  role: string;
+  provider?: string;
+  isGod: boolean;
+  breaker: string;
+  tokens: number;
+  usd: number;
+  lastActiveSecAgo: number | null;
+  inboxBacklog: number;
+}
+
+export interface WebhookOperationalSnapshot {
+  generatedAt: string;
+  counts: Record<'todo' | 'doing' | 'blocked' | 'done', number>;
+  tasks: WebhookOperationalTask[];
+  agents: WebhookOperationalAgent[];
+}
+
+export interface WebhookHumanAnswer {
+  taskId: string;
+  answer: string;
+}
+
+export type WebhookHumanAnswerResult =
+  | { ok: true }
+  | { ok: false; status: 400 | 404 | 409 | 503; error: string };
+
 export interface WebhookServerOptions {
   /** Local TCP port the HTTP server binds to (and the tunnel forwards to). */
   port: number;
@@ -116,6 +163,13 @@ export interface WebhookServerOptions {
    * never reveal or enumerate any other task.
    */
   lookupStatus: (token: string) => WebhookTaskStatus | null;
+  /** Read-only, secret-gated operational state for a trusted dashboard. */
+  readSnapshot: (endpoint: WebhookEndpointRef) => WebhookOperationalSnapshot;
+  /** Record one answer to an existing open human question. */
+  answerHumanQuestion: (
+    input: WebhookHumanAnswer,
+    endpoint: WebhookEndpointRef,
+  ) => WebhookHumanAnswerResult;
 }
 
 /** Reject bodies larger than this before buffering — callers send tiny JSON; the
@@ -129,6 +183,8 @@ const RATE_LIMIT = 120;
  *  instead of everyone's. Strictly below the global cap, or it would never bind. */
 const PER_ENDPOINT_RATE_LIMIT = 60;
 const RATE_WINDOW_MS = 60_000;
+const MAX_ANSWER_LENGTH = 100_000;
+const MAX_TASK_ID_LENGTH = 256;
 
 /** Bare `POST /` keeps serving the endpoint the pre-multi-endpoint migration
  *  parked under this id, so a caller already pointed at the old URL is unaffected. */
@@ -147,6 +203,11 @@ export class WebhookServer {
   private endpoints = new Map<string, WebhookEndpoint>();
   private readonly onMessage: (msg: WebhookInbound, endpoint: WebhookEndpointRef) => WebhookDispatch | null;
   private readonly lookupStatus: (token: string) => WebhookTaskStatus | null;
+  private readonly readSnapshot: (endpoint: WebhookEndpointRef) => WebhookOperationalSnapshot;
+  private readonly answerHumanQuestion: (
+    input: WebhookHumanAnswer,
+    endpoint: WebhookEndpointRef,
+  ) => WebhookHumanAnswerResult;
   /** Compared against when the requested id doesn't exist, purely so the failure
    *  path does the same work as a wrong-secret failure. Random per process and
    *  never exported, so it cannot be matched even by accident. */
@@ -159,6 +220,8 @@ export class WebhookServer {
     this.port = opts.port;
     this.onMessage = opts.onMessage;
     this.lookupStatus = opts.lookupStatus;
+    this.readSnapshot = opts.readSnapshot;
+    this.answerHumanQuestion = opts.answerHumanQuestion;
     this.setEndpoints(opts.endpoints);
   }
 
@@ -276,16 +339,85 @@ export class WebhookServer {
   private handleRequest(req: IncomingMessage, res: ServerResponse): void {
     // Rate limit first — cheapest possible rejection, ahead of any work.
     if (!this.allowRequest('', RATE_LIMIT)) { json(res, 429, { ok: false, error: 'rate limited' }); return; }
-    const id = readEndpointId(req);
-    const endpoint = id !== null ? this.endpoints.get(id) ?? null : null;
+    const route = readWebhookRoute(req);
+    const endpoint = route.id !== null ? this.endpoints.get(route.id) ?? null : null;
     // Per-endpoint budget, with every unknown id sharing one bucket (see UNKNOWN_BUCKET).
     if (!this.allowRequest(endpoint ? endpoint.id : UNKNOWN_BUCKET, PER_ENDPOINT_RATE_LIMIT)) {
       json(res, 429, { ok: false, error: 'rate limited' }); return;
     }
+    if (route.resource === 'snapshot') { this.handleSnapshot(req, res, endpoint); return; }
+    if (route.resource === 'answer') { this.handleAnswer(req, res, endpoint); return; }
     const method = req.method ?? '';
     if (method === 'GET') { this.handleStatus(req, res, endpoint); return; }
     if (method === 'POST') { this.handleCreate(req, res, endpoint); return; }
     res.writeHead(405); res.end();
+  }
+
+  /** Secret-gated operational read model. Configuration and credentials never enter it. */
+  private handleSnapshot(req: IncomingMessage, res: ServerResponse, endpoint: WebhookEndpoint | null): void {
+    if (!this.verifySecret(req, endpoint) || !endpoint) {
+      json(res, 401, { ok: false, error: 'unauthorized' }); return;
+    }
+    if (req.method !== 'GET') { res.writeHead(405); res.end(); return; }
+    try {
+      const snapshot = this.readSnapshot({ id: endpoint.id, name: endpoint.name });
+      json(res, 200, { ok: true, snapshot });
+    } catch {
+      json(res, 500, { ok: false, error: 'snapshot unavailable' });
+    }
+  }
+
+  /** Secret-gated answer path; the answer is never echoed in the response. */
+  private handleAnswer(req: IncomingMessage, res: ServerResponse, endpoint: WebhookEndpoint | null): void {
+    if (!this.verifySecret(req, endpoint) || !endpoint) {
+      json(res, 401, { ok: false, error: 'unauthorized' }); return;
+    }
+    if (req.method !== 'POST') { res.writeHead(405); res.end(); return; }
+
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let aborted = false;
+    req.on('data', (c: Buffer) => {
+      if (aborted) return;
+      size += c.length;
+      if (size > MAX_BODY_BYTES) {
+        aborted = true;
+        json(res, 413, { ok: false, error: 'too large' });
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on('end', () => {
+      if (aborted) return;
+      let parsed: unknown;
+      try { parsed = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
+      catch { json(res, 400, { ok: false, error: 'bad json' }); return; }
+      const body = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        ? parsed as Record<string, unknown>
+        : {};
+      const taskId = typeof body.taskId === 'string' ? body.taskId.trim() : '';
+      const answer = typeof body.answer === 'string' ? body.answer.trim() : '';
+      if (!taskId || taskId.length > MAX_TASK_ID_LENGTH || !answer || answer.length > MAX_ANSWER_LENGTH) {
+        json(res, 400, { ok: false, error: 'valid taskId and answer required' }); return;
+      }
+      try {
+        const result = this.answerHumanQuestion(
+          { taskId, answer },
+          { id: endpoint.id, name: endpoint.name },
+        );
+        if (!result.ok) {
+          json(res, result.status, { ok: false, error: result.error });
+          return;
+        }
+        json(res, 200, { ok: true });
+      } catch {
+        json(res, 500, { ok: false, error: 'answer could not be recorded' });
+      }
+    });
+    req.on('error', () => {
+      if (!aborted) { try { res.writeHead(400); res.end(); } catch { /* socket gone */ } }
+    });
   }
 
   /**
@@ -396,14 +528,21 @@ export class WebhookServer {
  * A deeper path (`/a/b`) resolves to null = "no such endpoint", which is then
  * answered exactly like a wrong secret / unknown token.
  */
-function readEndpointId(req: IncomingMessage): string | null {
+function readWebhookRoute(req: IncomingMessage): {
+  id: string | null;
+  resource: 'task' | 'snapshot' | 'answer' | 'unknown';
+} {
   let pathname: string;
   try { pathname = new URL(req.url ?? '/', 'http://localhost').pathname; }
-  catch { return null; }
+  catch { return { id: null, resource: 'unknown' }; }
   const segments = pathname.split('/').filter((s) => s.length > 0);
-  if (segments.length === 0) return LEGACY_ENDPOINT_ID;
-  if (segments.length > 1) return null;
-  try { return decodeURIComponent(segments[0]); } catch { return segments[0]; }
+  if (segments.length === 0) return { id: LEGACY_ENDPOINT_ID, resource: 'task' };
+  let id: string;
+  try { id = decodeURIComponent(segments[0]); } catch { id = segments[0]; }
+  if (segments.length === 1) return { id, resource: 'task' };
+  if (segments.length === 2 && segments[1] === 'snapshot') return { id, resource: 'snapshot' };
+  if (segments.length === 2 && segments[1] === 'answer') return { id, resource: 'answer' };
+  return { id: null, resource: 'unknown' };
 }
 
 /** Parse the endpoint's stored schema. An unparseable one yields `undefined`,
