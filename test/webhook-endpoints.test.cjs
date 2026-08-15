@@ -45,6 +45,8 @@ function endpoints() {
 /** A server whose callbacks record what they were handed. */
 function makeServer(overrides = {}) {
   const seen = [];
+  const snapshotSeen = [];
+  const answerSeen = [];
   const server = new WebhookServer({
     port: 0,
     endpoints: endpoints(),
@@ -55,9 +57,24 @@ function makeServer(overrides = {}) {
     },
     lookupStatus: (token) =>
       token === 'good-token' ? { status: 'todo', title: 'a card' } : null,
+    readSnapshot: (endpoint) => {
+      snapshotSeen.push(endpoint);
+      return {
+        generatedAt: '2026-08-15T12:00:00.000Z',
+        counts: { todo: 2, doing: 1, blocked: 1, done: 4 },
+        tasks: [{ id: 'task-1', title: 'A task', status: 'doing', dependsOn: [], priority: 1, createdAt: '2026-08-15T11:00:00.000Z' }],
+        agents: [{ id: 'god', name: 'Michael', role: 'orchestrator', isGod: true, breaker: 'healthy', tokens: 10, usd: 0.01, lastActiveSecAgo: 2, inboxBacklog: 0 }]
+      };
+    },
+    answerHumanQuestion: (input, endpoint) => {
+      answerSeen.push({ input, endpoint });
+      return input.taskId === 'task-1'
+        ? { ok: true }
+        : { ok: false, status: 404, error: 'task not found' };
+    },
     ...overrides.opts
   });
-  return { server, seen };
+  return { server, seen, snapshotSeen, answerSeen };
 }
 
 /** Fire one request through the handler and resolve with `{status, body}`. */
@@ -135,6 +152,60 @@ test('a nested path is not an endpoint', async () => {
     url: '/alpha/extra', headers: auth(SECRET_A), body: post({ message: 'hi' })
   });
   assert.equal(res.status, 401);
+});
+
+test('GET /<endpoint>/snapshot is secret-gated and returns the sanitised operational view', async () => {
+  const { server, snapshotSeen } = makeServer();
+  const ok = await request(server, {
+    method: 'GET', url: '/alpha/snapshot', headers: auth(SECRET_A)
+  });
+  assert.equal(ok.status, 200);
+  assert.equal(ok.body.ok, true);
+  assert.equal(ok.body.snapshot.counts.blocked, 1);
+  assert.equal(ok.body.snapshot.tasks[0].id, 'task-1');
+  assert.deepEqual(snapshotSeen, [{ id: 'alpha', name: 'Alpha' }]);
+
+  const wrongSecret = await request(server, {
+    method: 'GET', url: '/alpha/snapshot', headers: auth(SECRET_B)
+  });
+  const unknownEndpoint = await request(server, {
+    method: 'GET', url: '/ghost/snapshot', headers: auth(SECRET_A)
+  });
+  assert.equal(wrongSecret.status, 401);
+  assert.deepEqual(unknownEndpoint, wrongSecret);
+  assert.equal(snapshotSeen.length, 1, 'unauthorised requests must not reach the snapshot callback');
+});
+
+test('POST /<endpoint>/answer records a bounded human answer without echoing it', async () => {
+  const { server, answerSeen } = makeServer();
+  const ok = await request(server, {
+    url: '/alpha/answer',
+    headers: auth(SECRET_A),
+    body: post({ taskId: 'task-1', answer: 'Use option B.' })
+  });
+  assert.deepEqual(ok, { status: 200, body: { ok: true } });
+  assert.deepEqual(answerSeen, [{
+    input: { taskId: 'task-1', answer: 'Use option B.' },
+    endpoint: { id: 'alpha', name: 'Alpha' }
+  }]);
+
+  const missing = await request(server, {
+    url: '/alpha/answer',
+    headers: auth(SECRET_A),
+    body: post({ taskId: 'missing', answer: 'anything' })
+  });
+  assert.deepEqual(missing, { status: 404, body: { ok: false, error: 'task not found' } });
+
+  for (const body of [
+    post({ taskId: '', answer: 'yes' }),
+    post({ taskId: 'task-1', answer: '   ' }),
+    post({ taskId: 'task-1', answer: 'x'.repeat(100_001) })
+  ]) {
+    const invalid = await request(server, {
+      url: '/alpha/answer', headers: auth(SECRET_A), body
+    });
+    assert.equal(invalid.status, 400);
+  }
 });
 
 test('setEndpoints revokes one endpoint without touching the others', async () => {

@@ -22,7 +22,13 @@ import {
   addWorktree, removeWorktree, worktreeHasUnintegratedWork, worktreeIsGcSafe,
   getLogGraph, getCommitFiles, getFileAtRev, compareRefs, listWorktrees, checkoutRef
 } from './git';
-import { HiveManager, type AgentMeta, type HiveMessage, type HiveTask } from './hive';
+import {
+  HiveManager,
+  redactSecrets,
+  type AgentMeta,
+  type HiveMessage,
+  type HiveTask,
+} from './hive';
 import { HookServer } from './hooks';
 import { CircuitBreaker, type BreakerInput } from './breaker';
 import type { UsageProvider } from './usage';
@@ -35,8 +41,19 @@ import { listIssues, listCIRuns } from './github';
 import { SlackWebhookServer, SlackReplyServer, postSlackReply, type SlackEventFile } from './slack';
 import {
   WebhookServer,
-  type WebhookDispatch, type WebhookEndpointRef, type WebhookInbound, type WebhookTaskStatus
+  type WebhookDispatch,
+  type WebhookEndpointRef,
+  type WebhookHumanAnswer,
+  type WebhookHumanAnswerResult,
+  type WebhookInbound,
+  type WebhookOperationalSnapshot,
+  type WebhookTaskStatus,
 } from './webhook';
+import {
+  applyHumanAnswer,
+  buildOperationalSnapshot,
+  type FleetSnapshot,
+} from './webhookOperations';
 import {
   classifyInboundKind, isAutoAllowed,
   DEFAULT_CONTEXT_TRIGGER, DEFAULT_ORG_TRIGGER, DEFAULT_TRIGGER_MODE, DEFAULT_WEBHOOK_SCHEMA,
@@ -1800,6 +1817,47 @@ function lookupWebhookStatus(token: string): WebhookTaskStatus | null {
   return null;
 }
 
+/** Secret-gated operational read model for trusted remote dashboards. */
+function readWebhookOperationalSnapshot(): WebhookOperationalSnapshot {
+  const ledger = hive.tasks() as { tasks?: HiveTask[] };
+  const tasks = Array.isArray(ledger?.tasks) ? ledger.tasks : [];
+  let fleet: FleetSnapshot = {};
+  const root = hive.root();
+  if (root) {
+    try { fleet = JSON.parse(readFileSync(join(root, 'fleet.json'), 'utf8')) as FleetSnapshot; }
+    catch { fleet = {}; }
+  }
+  return buildOperationalSnapshot({
+    tasks,
+    registry: hive.registry(),
+    fleet,
+    redact: redactSecrets,
+  });
+}
+
+/** Mirror the desktop ASK ME answer flow: persist the answer, then notify god. */
+function answerWebhookHumanQuestion(input: WebhookHumanAnswer): WebhookHumanAnswerResult {
+  const ledger = hive.tasks() as { tasks?: HiveTask[] };
+  const tasks = Array.isArray(ledger?.tasks) ? ledger.tasks : [];
+  const applied = applyHumanAnswer(tasks, input);
+  if (!applied.result.ok || !applied.notification) return applied.result;
+
+  hive.writeTasks(applied.tasks);
+  const note = applied.notification;
+  hive.send({
+    to: 'god',
+    act: 'inform',
+    subject: `HUMAN ANSWER on task "${note.title}"`,
+    body: [
+      `The human answered the open question on task ${note.taskId} ("${note.title}"):`,
+      `Q: ${note.question}`,
+      `A: ${note.answer}`,
+      'The answer is also recorded in the card\'s humanQA. Act on it, unblock the card, and continue the work.',
+    ].join('\n'),
+  }, 'human');
+  return applied.result;
+}
+
 // ─── Webhook done-observer (the OUTBOUND half of the trigger ledger) ─────────
 // Mirrors `pollSlackDoneTasks`: watch the kanban for webhook-origin cards that
 // reach 'done' and write the reply side of the conversation, tagged with the
@@ -1893,7 +1951,9 @@ async function startWebhookServer(): Promise<{ ok: boolean; url?: string; error?
     port: cfg.webhookPort && cfg.webhookPort > 0 ? cfg.webhookPort : WEBHOOK_DEFAULT_PORT,
     endpoints,
     onMessage: handleWebhookMessage,
-    lookupStatus: lookupWebhookStatus
+    lookupStatus: lookupWebhookStatus,
+    readSnapshot: readWebhookOperationalSnapshot,
+    answerHumanQuestion: answerWebhookHumanQuestion,
   });
   webhookServer = server;
   const res = await server.start();
