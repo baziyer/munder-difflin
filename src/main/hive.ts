@@ -94,6 +94,10 @@ export interface HumanQA {
   a?: string;
   askedAt?: string;
   answeredAt?: string;
+  /** Main-minted proof that this answer crossed a human-owned answer surface. */
+  answerSource?: 'webhook' | 'desktop';
+  answerEndpointId?: string;
+  answerReceipt?: string;
 }
 
 export interface HiveTask {
@@ -135,6 +139,10 @@ export interface AgentMeta {
   /** Michael's prep assistant — enriches prompts and forwards them to Michael.
    *  Send-only: excluded from broadcast fan-out so it never drains an inbox. */
   isAssistant?: boolean;
+  /** Provisioned through an exact human-approved standing-hire envelope. */
+  standingHire?: boolean;
+  /** Present only while that exact approved request is still provisioning. */
+  standingHireRequestId?: string;
 }
 
 export interface RegistryAgent extends AgentMeta {
@@ -324,6 +332,10 @@ export class HiveManager {
     const root = this.root();
     return root ? join(root, 'bin', 'hive-proxy.cjs') : null;
   }
+  private persistentHireDigestPath(): string | null {
+    const root = this.root();
+    return root ? join(root, 'bin', 'persistent-hire-digest.cjs') : null;
+  }
 
   /**
    * The BUNDLED-NODE launcher: `<root>/bin/hive-node` (POSIX) / `hive-node.cmd`
@@ -489,6 +501,9 @@ export class HiveManager {
     writeFileSync(this.shimPath()!, HOOK_SHIM, 'utf8');
     // The proxy-bridge sidecar for hookless CLIs (qwen). Same refresh policy.
     writeFileSync(this.proxyShimPath()!, PROXY_BRIDGE_SHIM, 'utf8');
+    // Small main-authored helper Michael uses BEFORE asking for standing-hire
+    // approval, so the human answer can bind every behavior/cost-bearing field.
+    writeFileSync(this.persistentHireDigestPath()!, PERSISTENT_HIRE_DIGEST_CLI, 'utf8');
     // The bundled-node launcher every shim above is invoked through — MUST be
     // written before any hook installer runs (they probe for it).
     this.writeNodeLauncher();
@@ -791,6 +806,80 @@ export class HiveManager {
     } catch { /* best-effort — never crash a lifecycle handler */ }
   }
 
+  /** Remove only a just-provisioned registration when a standing hire fails
+   * before its assignment is durably delivered. This deliberately leaves the
+   * agent directory on disk (memory/inbox data is never destroyed), while
+   * allowing an authorised retry of the same identity. */
+  forgetProvisionalAgent(id: string, requestId: string): boolean {
+    const root = this.root();
+    if (!root) return false;
+    try {
+      const reg = this.registry();
+      if (reg.agents[id]?.standingHireRequestId !== requestId) return false;
+      delete reg.agents[id];
+      this.writeJson(join(root, 'registry.json'), reg);
+      this.appendLog({ kind: 'provisional-spawn-rollback', agentId: id });
+      this.commit(`hive: roll back provisional ${id}`);
+      return true;
+    } catch (e) {
+      console.error('[hive] forgetProvisionalAgent failed:', e);
+      return false;
+    }
+  }
+
+  /** Create only the durable mailbox skeleton needed to queue a standing
+   * hire's first assignment before any asynchronous CLI setup. This
+   * intentionally does not create a registry identity; ensureAgent still owns
+   * the full workspace and registry transaction when the process starts. */
+  ensureProvisionalMailbox(id: string): boolean {
+    const root = this.root();
+    if (!root || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(id)) return false;
+    try {
+      const dir = this.agentDir(id);
+      mkdirSync(join(dir, 'inbox', '.done'), { recursive: true });
+      mkdirSync(join(dir, 'outbox', '.sent'), { recursive: true });
+      return true;
+    } catch (e) {
+      console.error('[hive] provisional mailbox failed:', e);
+      return false;
+    }
+  }
+
+  completeStandingHire(id: string, requestId: string): boolean {
+    const root = this.root();
+    if (!root) return false;
+    try {
+      const reg = this.registry();
+      const agent = reg.agents[id];
+      if (!agent || agent.standingHire !== true || agent.standingHireRequestId !== requestId) return false;
+      delete agent.standingHireRequestId;
+      this.writeJson(join(root, 'registry.json'), reg);
+      return true;
+    } catch (e) {
+      console.error('[hive] standing-hire completion marker failed:', e);
+      return false;
+    }
+  }
+
+  /** Re-arm the same standing-hire transaction after its process started but
+   * failed readiness. Only an existing standing identity can be reopened. */
+  reopenStandingHire(id: string, requestId: string): boolean {
+    const root = this.root();
+    if (!root) return false;
+    try {
+      const reg = this.registry();
+      const agent = reg.agents[id];
+      if (!agent || agent.standingHire !== true) return false;
+      if (agent.standingHireRequestId && agent.standingHireRequestId !== requestId) return false;
+      agent.standingHireRequestId = requestId;
+      this.writeJson(join(root, 'registry.json'), reg);
+      return true;
+    } catch (e) {
+      console.error('[hive] standing-hire retry marker failed:', e);
+      return false;
+    }
+  }
+
   /**
    * Persist the agent's Claude Code session_id (Lane A #6.6a). Captured from hook
    * payloads; written only when it actually changes (a new session), so this is a
@@ -1065,12 +1154,15 @@ export class HiveManager {
       : '';
     const godLine = meta.isGod
       ? 'You are the GOD / ORCHESTRATOR of this hive — your job is to ORCHESTRATE, not to implement: maintain live situational awareness and delegate the work. (1) AWARENESS — always know what is going on: keep an accurate picture of every agent (active vs archived/idle), the task board, and all in-flight work; drain your inbox continually and triage every other agent\'s requests, answering clarifications so the team runs autonomously. (2) DELEGATE — decompose work and fan it out to the hive agents via their inboxes (route messages and assign owners; do not do their jobs); do NOT take on grunt implementation yourself. Stay aware of who is already on the floor and delegate OPPORTUNISTICALLY: BEFORE you spawn anything, CHECK THE LIVE ROSTER (active agents in registry.json + their state in fleet.json) and prefer routing to an EXISTING agent that fits — above all when the request names one ("ask Pam to…", "have Jim…"), route to that agent instead of reflexively creating a new one. Reuse an idle or already-running agent whose role matches; only spawn a fresh agent when no existing one is a sensible fit, and say that you checked. One capable owner beats a duplicate. (3) OWN ONLY THE IMPORTANT, high-leverage things — task decomposition, dispatch decisions, sign-offs, conflict resolution, branch integration, and final QA — and remain the sole scribe of board.md. You are otherwise fully autonomous — there is NO separate approval queue. For the genuinely critical (destructive actions, spending real money, scope changes, unresolvable conflicts), ask the human directly in your own session and let the tool-permission prompt gate the action; the human approves natively, including remotely from their phone via /remote-control. Keep the team unblocked. When you DISPATCH a task, write it as a 4-part contract so the agent can run autonomously: (1) OBJECTIVE — the concrete goal; (2) OUTPUT — the expected deliverable/format; (3) TOOLS — what to use or avoid, and any references to read instead of re-deriving; (4) BOUNDARIES — scope limits + the definition of done. Pass references (file paths, message ids, board sections), not pasted content — keep dispatches short.'
-        + ` MONITOR the floor by reading ${root}/fleet.json (live per-agent tokens, cost, status, last tool, breaker level, inbox backlog) and ${root}/registry.json — note that running 'claude agents' will NOT list your hive's sibling agents. A full Claude Code command reference is at ${root}/COMMANDS.md (slash commands act ONLY on your own session; CLI commands run in your shell and can target the fleet). You periodically receive scheduler / "Heartbeat" standup requests — on each, review every agent via fleet.json, re-engage anyone stalled, over-budget, or breaker-armed, and keep board.md and tasks.json accurate. In tasks.json, ALWAYS set each task's "assignee" to the worker's agent id the moment you dispatch it, and NEVER clear it on status changes — a done card must still say who did the work (the human reads the board by who-did-what). HUMAN FEEDBACK is first-class in the ledger: when a task can only proceed with the human's input — a QUESTION to answer OR an ACTION only the human can perform (create an account, approve a purchase, provide credentials/screenshots, test on their device) — set its status to "blocked" and append the concrete ask to the card's "humanQA" array (push {"q":"...","askedAt":"<iso>"}; phrase actions as clear to-dos; keep every past entry — the history documents the card's decisions). The harness surfaces open questions on the office floor's ASK ME board; the human's answer lands in the same entry ("a") AND arrives as an inbox message to you — read it, act on it, and unblock the card so work continues. Do NOT park human questions in separate files (no HumanQuestion.md) and never sit waiting on the human in your own session. Steward the token budget.`
+        + ` MONITOR the floor by reading ${root}/fleet.json (live per-agent tokens, cost, status, last tool, breaker level, inbox backlog) and ${root}/registry.json — note that running 'claude agents' will NOT list your hive's sibling agents. A full Claude Code command reference is at ${root}/COMMANDS.md (slash commands act ONLY on your own session; CLI commands run in your shell and can target the fleet). You periodically receive scheduler / "Heartbeat" standup requests — on each, review every agent via fleet.json, re-engage anyone stalled, over-budget, or breaker-armed, and keep board.md and tasks.json accurate. In tasks.json, ALWAYS set each task's "assignee" to the worker's agent id the moment you dispatch it, and NEVER clear it on status changes — a done card must still say who did the work (the human reads the board by who-did-what). HUMAN FEEDBACK is first-class in the ledger: when a task can only proceed with the human's input — a QUESTION to answer OR an ACTION only the human can perform (create an account, approve a purchase, provide credentials/screenshots, test on their device) — set its status to "blocked" and append the concrete ask to the card's "humanQA" array (push {"q":"...","askedAt":"<iso>"}; phrase actions as clear to-dos; keep every past entry — the history documents the card's decisions). The harness surfaces open questions on the office floor's ASK ME board; the human's answer lands in the same entry ("a") AND arrives as an inbox message to you — read it, act on it, and unblock the card so work continues. Do NOT park human questions in separate files (no HumanQuestion.md) and never sit waiting on the human in your own session. For a NEW standing identity, follow "Authorized standing hires" in ${root}/PROTOCOL.md: after exact authenticated staffing approval, provision it through the persistent-hire queue without asking for another human import click. Steward the token budget.`
       : meta.isAssistant
       ? 'You are Michael\'s PREP ASSISTANT. You will be handed short, possibly vague instructions (each begins with "ENRICH TASK:"). For each one: (1) figure out which project it concerns and cd into the most relevant repo — you start in Michael\'s home directory; (2) gather concrete context READ-ONLY (exact file paths, current state, relevant code, conventions, active branch, gotchas) — NEVER modify, create, or delete files; (3) rewrite the instruction into ONE clear, self-contained prompt that Michael can execute autonomously, preserving the user\'s original intent without inventing scope. Then deliver it: write ONE message JSON into your outbox with "to":"god", "act":"request", a short subject, and the finished prompt as the body. Do NOT perform the task yourself — your only output is the improved prompt sent to Michael.'
       : 'For anything ambiguous, cross-cutting, or needing sign-off, address a message to "god".';
     const recoveryLine = meta.isGod
       ? `PERSISTENT FLEET RECOVERY: You own routine worker liveness; never make the human inspect, nudge, or restart an idle worker. First inspect fleet.json, registry.json, the exact process, inbox/.done timestamps, saved session and worktree state; re-deliver one concrete instruction; use one temporary diagnostic worker if the cause is unclear. When a persistent worker still needs recovery, write ONE JSON file to ${root}/recovery-requests/<request-id>.json: {"spec":"munder-difflin/recover@1","id":"<request-id>","agentId":"<existing-id>","expectedSessionId":"<CURRENT registry sessionId>","reason":"<evidence and steps already tried>"}. The harness only restores/restarts the same non-god roster id from its saved recipe and refuses a changed/missing session rather than starting fresh. Before requesting it, checkpoint exact HEAD/status/diff or its existing backup; afterwards verify inbox consumption and close stale fleet-health humanQA. Escalate only a genuine human-only boundary (unavoidable interactive trust/approval, credentials, new spend/infrastructure, irreversible action, or product decision).`
+      : '';
+    const availabilityLine = meta.isGod
+      ? 'AVAILABILITY: Never park your terminal in an unbounded sleep/until/tail/poll loop. Do one bounded check, act, then return to orchestration; Munder scheduler and inbox delivery drive the next turn.'
       : '';
     const guardrailsLine = 'Guardrails: a circuit breaker watches the floor — a "Circuit breaker: steer/constrain" message means you are looping or overspending, so STOP repeating, summarize what you tried, and follow it. Be token-frugal (a floor-wide or per-agent token budget can pause you). The shared plan has two parts: board.md (freeform; god is the sole scribe) and tasks.json (structured kanban — todo/doing/blocked/done).';
     const slackLine = meta.isGod
@@ -1090,6 +1182,7 @@ export class HiveManager {
       knowledgeLine,
       godLine,
       recoveryLine,
+      availabilityLine,
       slackLine,
       `Env vars available to you: AGENT_ID, AGENT_NAME, HIVE_ROOT, AGENT_DIR.`
     ].filter(Boolean).join('\n');
@@ -1292,9 +1385,27 @@ export class HiveManager {
           this.routeMessage(msg);
           renameSync(full, join(outbox, '.sent', f)); // archive, don't reprocess
           routed++;
-        } catch {
+        } catch (e) {
           // malformed file — quarantine so we don't spin on it
           try { renameSync(full, join(outbox, '.sent', `bad-${f}`)); } catch { /* noop */ }
+          this.appendLog({
+            kind: 'malformed-outbox',
+            agentId: id,
+            file: f,
+            error: e instanceof Error ? e.message : String(e),
+          });
+          // Silent quarantine made a worker wait forever for a reply Michael
+          // never knew existed. Surface only metadata (never malformed content)
+          // so the orchestrator can ask for a corrected message.
+          const godId = this.registry().godId ?? 'god';
+          const notice = this.normalize({
+            to: godId,
+            act: 'inform',
+            subject: `[outbox message quarantined] ${id}/${f}`,
+            body: `Malformed JSON from ${id} was moved to outbox/.sent/bad-${f}. Its intended action could not be read; ask ${id} to recreate the message.`,
+          }, 'router');
+          this.routeMessage(notice);
+          routed++;
         }
       }
     }
@@ -1990,7 +2101,9 @@ The god owns routine worker liveness; do not make the human inspect, nudge, or
 restart an idle worker. First inspect \`fleet.json\`, \`registry.json\`, the exact
 process, inbox/\`.done\` timestamps, session and worktree state; re-send one
 concrete instruction; use one temporary diagnostic worker if the cause is
-unclear. Before recovery, checkpoint exact HEAD/status/diff or confirm its
+unclear. Never park your terminal in an unbounded sleep/until/tail/poll loop;
+do one bounded check and let Munder's scheduler or inbox delivery trigger the
+next turn. Before recovery, checkpoint exact HEAD/status/diff or confirm its
 existing backup. Then write one JSON file to
 \`recovery-requests/<request-id>.json\`:
 
@@ -2012,6 +2125,41 @@ session and refuses instead of silently starting fresh. Requests move to
 interactive trust/approval, credentials, new spend/infrastructure, irreversible
 action, or product choice.
 
+## Authorized standing hires (orchestrator only)
+Importing a shared hire manifest remains review-only. Once the human explicitly
+approves a standing identity, however, provision it without asking for another
+Add-Agent/import click. First make the final manifest, then compute the exact
+approval digest:
+
+\`"$HIVE_NODE" "$HIVE_ROOT/bin/persistent-hire-digest.cjs" <manifest.json> <agent-id> <absolute-cwd>\`
+
+The approval question must contain that complete \`sha256:...\` output and name
+the exact id, manifest name, absolute source repo, provider, model, and \`isolate off\`.
+Standing identities start in a non-repository Munder control workspace; each
+coding assignment must use its own clean worktree off \`main\` and a PR. After the signed
+desktop Ask Me or authenticated Minerva answer arrives, write one JSON
+file to \`spawn-requests/<request-id>.json\`:
+
+\`\`\`json
+{
+  "spec": "munder-difflin/persistent-hire@1",
+  "id": "hire-stanley-20260815",
+  "agentId": "stanley-thermal-bridge",
+  "cwd": "/absolute/approved/repo",
+  "approval": {
+    "taskId": "the-task-with-the-answer",
+    "answeredAt": "the exact humanQA answeredAt timestamp"
+  },
+  "objective": "The first assignment Michael has scoped",
+  "manifest": { "spec": "munder-difflin/hire@1", "name": "..." }
+}
+\`\`\`
+
+The harness verifies the authenticated affirmative answer and exact digest, uses
+only local provider commands, and caps concurrent standing workers. Existing or
+archived ids use persistent recovery. Never manufacture an answer or weaken the
+approved envelope.
+
 ## Semantic memory (optional — when \`mempalace\` is installed)
 When \`MEMPALACE_PALACE_PATH\` is set in your environment, the hive shares a
 searchable MemPalace and you have the \`mempalace\` CLI:
@@ -2022,6 +2170,35 @@ searchable MemPalace and you have the \`mempalace\` CLI:
 
 Your \`memory.md\` is mined into the palace automatically, so the durable facts you
 write there become searchable by every agent. You don't run \`mine\` yourself.
+`;
+
+// ─── persistent-hire digest CLI (written to <hive>/bin/) ───────────────────
+// Intentionally dependency-free: Michael can run it through $HIVE_NODE even on
+// a machine whose interactive Node/npm setup is unavailable.
+const PERSISTENT_HIRE_DIGEST_CLI = `#!/usr/bin/env node
+'use strict';
+const fs = require('node:fs');
+const crypto = require('node:crypto');
+const [manifestPath, agentId, cwd] = process.argv.slice(2);
+if (!manifestPath || !agentId || !cwd) {
+  console.error('usage: persistent-hire-digest.cjs <manifest.json> <agent-id> <absolute-cwd>');
+  process.exit(2);
+}
+function canonical(value) {
+  if (Array.isArray(value)) return value.map(canonical);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, item]) => [key, canonical(item)]));
+}
+try {
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  const body = JSON.stringify(canonical({ agentId: agentId.trim(), cwd: cwd.trim(), manifest }));
+  console.log('sha256:' + crypto.createHash('sha256').update(body).digest('hex'));
+} catch (error) {
+  console.error(error instanceof Error ? error.message : String(error));
+  process.exit(1);
+}
 `;
 
 // ─── cth-hook shim (written to <hive>/bin/cth-hook.cjs) ──────────────────────

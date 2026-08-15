@@ -23,6 +23,7 @@ export interface PersistentRecoveryRecipe {
   command: string;
   ptyId: string;
   description?: string;
+  standingHire?: boolean;
 }
 
 interface RegistryAgentLike {
@@ -31,6 +32,7 @@ interface RegistryAgentLike {
   provider?: unknown;
   sessionId?: unknown;
   archived?: unknown;
+  standingHire?: unknown;
 }
 
 interface RegistryLike {
@@ -159,8 +161,13 @@ export function planPersistentRecovery(input: {
   if (sessionId !== request.expectedSessionId) {
     return { ok: false, error: 'agent session changed after this request was authored' };
   }
-  const recipe = findRecipe(roster, request.agentId);
-  if (!recipe) return { ok: false, error: 'agent has no saved spawn recipe' };
+  const savedRecipe = findRecipe(roster, request.agentId);
+  if (!savedRecipe) return { ok: false, error: 'agent has no saved spawn recipe' };
+  // Standing-hire status is main-owned registry state. Do not depend on the
+  // renderer round-tripping an orchestration marker through its roster card.
+  const recipe = agent.standingHire === true
+    ? { ...savedRecipe, standingHire: true }
+    : savedRecipe;
   const liveOwner = livePtyOwners.get(recipe.ptyId);
   if (livePtyOwners.has(recipe.ptyId) && liveOwner !== request.agentId) {
     return { ok: false, error: 'saved PTY belongs to a different agent' };

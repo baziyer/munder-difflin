@@ -20,10 +20,14 @@ const fs = require('node:fs');
 const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
-const { spawn } = require('node:child_process');
+const { execFileSync, spawn } = require('node:child_process');
 const loadTs = require('./load-ts.cjs');
 
 const { HiveManager } = loadTs('src/main/hive.ts');
+const {
+  parsePersistentHireRequest,
+  persistentHireApprovalDigest
+} = loadTs('src/main/persistentHire.ts');
 
 const POSIX = process.platform !== 'win32';
 const STRIPPED_PATH = '/usr/bin:/bin:/usr/sbin:/sbin';
@@ -85,6 +89,58 @@ test('ensureHive writes an executable bundled-node launcher', async (t) => {
   assert.match(body, /ELECTRON_RUN_AS_NODE=1/, 'without this the binary opens a second app window');
   assert.ok(body.includes(process.execPath), 'execPath is re-baked each bootstrap so an app move/update heals');
   if (POSIX) assert.ok(fs.statSync(launcher).mode & 0o111, 'must be executable');
+});
+
+test('ensureHive writes a standing-hire digest helper matching main validation', async (t) => {
+  const home = tmpHome();
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const hive = new HiveManager(() => home);
+  await hive.ensureAgent({ id: 'a1', name: 'A', provider: 'claude', cwd: home });
+
+  const manifest = {
+    spec: 'munder-difflin/hire@1',
+    name: ' Stanley ',
+    provider: 'agy',
+    model: 'sonnet',
+    isolate: false,
+    accent: 'SKY',
+    ignoredByValidator: 'still bound by the approval digest'
+  };
+  const manifestPath = path.join(home, 'stanley.hire.json');
+  fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+  const parsed = parsePersistentHireRequest({
+    spec: 'munder-difflin/persistent-hire@1',
+    id: 'hire-stanley',
+    agentId: 'stanley',
+    cwd: home,
+    approval: { taskId: 'approval-task', answeredAt: '2026-08-15T12:00:00.000Z' },
+    objective: 'Start the approved programme.',
+    manifest
+  });
+  assert.equal(parsed.ok, true);
+
+  const helper = path.join(home, 'hive/bin/persistent-hire-digest.cjs');
+  const output = execFileSync(process.execPath, [helper, manifestPath, ' stanley ', ` ${home} `], {
+    encoding: 'utf8'
+  }).trim();
+  assert.equal(output, `sha256:${persistentHireApprovalDigest(parsed.request)}`);
+});
+
+test('malformed worker outbox is quarantined and surfaced to Michael', async (t) => {
+  const home = tmpHome();
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const hive = new HiveManager(() => home);
+  await hive.ensureAgent({ id: 'god', name: 'Michael', provider: 'claude', cwd: home, isGod: true });
+  await hive.ensureAgent({ id: 'oscar', name: 'Oscar', provider: 'codex', cwd: home });
+
+  const bad = path.join(home, 'hive/agents/oscar/outbox/blocker.json');
+  fs.writeFileSync(bad, '+{"to":"god"}', 'utf8');
+  assert.equal(hive.routeOnce(), 1);
+  assert.equal(fs.existsSync(path.join(home, 'hive/agents/oscar/outbox/.sent/bad-blocker.json')), true);
+  const notices = hive.inbox('god');
+  assert.equal(notices.length, 1);
+  assert.match(notices[0].subject, /outbox message quarantined/);
+  assert.match(notices[0].body, /ask oscar to recreate/);
 });
 
 test('the claude hook + statusLine commands run through the launcher', async (t) => {

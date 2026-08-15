@@ -75,6 +75,10 @@ export interface Agent {
   /** Michael's prep assistant — send-only; enriches prompts and forwards them to
    *  the god. Excluded from broadcast fan-out and from the restorable-dead sweep. */
   isAssistant?: boolean;
+  /** Main-owned marker for a durable, explicitly approved standing hire. */
+  standingHire?: boolean;
+  /** Exact request still being reconciled by main; never restore directly. */
+  standingHireRequestId?: string;
   /** When git isolation is enabled, the dedicated worktree path the agent runs
    *  in (its own `agent/<id>` branch); undefined for shared-cwd agents. */
   worktreePath?: string;

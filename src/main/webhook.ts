@@ -144,7 +144,7 @@ export interface WebhookHumanAnswer {
 
 export type WebhookHumanAnswerResult =
   | { ok: true }
-  | { ok: false; status: 404 | 409; error: string };
+  | { ok: false; status: 400 | 404 | 409 | 503; error: string };
 
 export interface WebhookServerOptions {
   /** Local TCP port the HTTP server binds to (and the tunnel forwards to). */

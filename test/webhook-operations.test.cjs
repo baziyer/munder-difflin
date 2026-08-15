@@ -8,6 +8,7 @@ const {
   applyHumanAnswer,
   buildOperationalSnapshot
 } = loadTs('src/main/webhookOperations.ts');
+const { verifyHumanAnswerReceipt } = loadTs('src/main/humanAnswerReceipt.ts');
 
 const NOW = Date.parse('2026-08-15T12:00:00.000Z');
 
@@ -92,6 +93,48 @@ test('applyHumanAnswer records the latest open answer without changing task stat
   assert.equal(applied.tasks[0].humanQA[1].a, 'Current answer');
   assert.equal(applied.tasks[0].humanQA[1].answeredAt, '2026-08-15T12:00:00.000Z');
   assert.equal(applied.notification.question, 'Current?');
+});
+
+test('applyHumanAnswer authenticates webhook provenance without persisting the secret', () => {
+  const secret = 'endpoint-secret-for-test';
+  const applied = applyHumanAnswer(
+    [task({ humanQA: [{ q: 'Approve exact hire?' }] })],
+    { taskId: 'task-1', answer: 'Yes, implement it.' },
+    NOW,
+    { source: 'webhook', endpointId: 'minerva', endpointSecret: secret }
+  );
+  const answer = applied.tasks[0].humanQA[0];
+  assert.equal(answer.answerSource, 'webhook');
+  assert.equal(answer.answerEndpointId, 'minerva');
+  assert.equal(typeof answer.answerReceipt, 'string');
+  assert.equal(JSON.stringify(answer).includes(secret), false);
+  assert.equal(verifyHumanAnswerReceipt(secret, {
+    taskId: 'task-1',
+    question: 'Approve exact hire?',
+    answer: 'Yes, implement it.',
+    answeredAt: '2026-08-15T12:00:00.000Z',
+    endpointId: 'minerva'
+  }, answer.answerReceipt), true);
+});
+
+test('applyHumanAnswer gives desktop Ask Me the same authenticated receipt contract', () => {
+  const secret = 'desktop-main-only-test-key';
+  const applied = applyHumanAnswer(
+    [task({ humanQA: [{ q: 'Approve from the desktop queue?' }] })],
+    { taskId: 'task-1', answer: 'Approved.' },
+    NOW,
+    { source: 'desktop', endpointId: 'desktop-ask-me', endpointSecret: secret }
+  );
+  const answer = applied.tasks[0].humanQA[0];
+  assert.equal(answer.answerSource, 'desktop');
+  assert.equal(answer.answerEndpointId, 'desktop-ask-me');
+  assert.equal(verifyHumanAnswerReceipt(secret, {
+    taskId: 'task-1',
+    question: 'Approve from the desktop queue?',
+    answer: 'Approved.',
+    answeredAt: '2026-08-15T12:00:00.000Z',
+    endpointId: 'desktop-ask-me'
+  }, answer.answerReceipt), true);
 });
 
 test('applyHumanAnswer fails closed for missing tasks or resolved asks', () => {

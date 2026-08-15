@@ -31,7 +31,8 @@ const registry = {
       name: 'Oscar',
       provider: 'codex',
       sessionId: 'session-123',
-      archived: false
+      archived: false,
+      standingHire: true
     }
   }
 };
@@ -68,6 +69,7 @@ test('planPersistentRecovery restarts a live saved agent without changing identi
   assert.equal(plan.mode, 'restart');
   assert.equal(plan.recipe.id, 'oscar-code-quality');
   assert.equal(plan.recipe.worktreePath, '/repo-oscar');
+  assert.equal(plan.recipe.standingHire, true);
   assert.equal(plan.sessionId, 'session-123');
 });
 
@@ -87,6 +89,7 @@ test('planPersistentRecovery restores an archived recipe with the same recorded 
   assert.equal(plan.ok, true);
   assert.equal(plan.mode, 'restore');
   assert.equal(plan.recipe.ptyId, 'oscar-code-quality');
+  assert.equal(plan.recipe.standingHire, true);
 
   const legacy = planPersistentRecovery({
     request: request(),

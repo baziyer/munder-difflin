@@ -4,6 +4,7 @@ import type {
   WebhookHumanAnswerResult,
   WebhookOperationalSnapshot,
 } from './webhook';
+import { signHumanAnswerReceipt } from './humanAnswerReceipt';
 
 interface FleetAgent {
   id?: unknown;
@@ -49,6 +50,12 @@ export interface AppliedHumanAnswer {
     question: string;
     answer: string;
   };
+}
+
+export interface HumanAnswerProvenance {
+  source: 'webhook' | 'desktop';
+  endpointId: string;
+  endpointSecret: string;
 }
 
 const MAX_ACTIVE_TASKS = 100;
@@ -184,6 +191,7 @@ export function applyHumanAnswer(
   tasks: HiveTask[],
   input: WebhookHumanAnswer,
   now = Date.now(),
+  provenance?: HumanAnswerProvenance,
 ): AppliedHumanAnswer {
   const index = tasks.findIndex((task) => task?.id === input.taskId);
   if (index < 0) {
@@ -198,10 +206,23 @@ export function applyHumanAnswer(
     };
   }
   const answeredAt = new Date(now).toISOString();
+  const answerProvenance = provenance
+    ? {
+        answerSource: provenance.source,
+        answerEndpointId: provenance.endpointId,
+        answerReceipt: signHumanAnswerReceipt(provenance.endpointSecret, {
+          taskId: task.id,
+          question: question.q,
+          answer: input.answer,
+          answeredAt,
+          endpointId: provenance.endpointId,
+        }),
+      }
+    : {};
   const questionIndex = task.humanQA!.lastIndexOf(question);
   const humanQA = task.humanQA!.map((entry, entryIndex) =>
     entryIndex === questionIndex
-      ? { ...entry, a: input.answer, answeredAt }
+      ? { ...entry, a: input.answer, answeredAt, ...answerProvenance }
       : entry,
   );
   const nextTasks = tasks.map((item, taskIndex) =>
